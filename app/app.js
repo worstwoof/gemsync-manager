@@ -15,6 +15,7 @@ const elements = {
   workflowHint: $("workflowHint"),
   stopJob: $("stopJob"),
   clearLog: $("clearLog"),
+  clearFinishedJobs: $("clearFinishedJobs"),
   refreshState: $("refreshState"),
   pickWorkspace: $("pickWorkspace"),
   scan: $("scan"),
@@ -35,6 +36,9 @@ const state = {
   chromeOk: false,
   jobs: [],
   refreshedJobIds: new Set(),
+  summaryRefreshInFlight: false,
+  lastSentSlides: null,
+  hiddenJobIds: new Set(JSON.parse(localStorage.getItem("gemsync-manager-hidden-jobs") || "[]")),
 };
 
 function setStatus(text) {
@@ -43,6 +47,30 @@ function setStatus(text) {
 
 function setWorkflowHint(text) {
   if (elements.workflowHint) elements.workflowHint.textContent = text;
+}
+
+function saveHiddenJobs() {
+  localStorage.setItem("gemsync-manager-hidden-jobs", JSON.stringify([...state.hiddenJobIds]));
+}
+
+function isJobVisible(job) {
+  return job.status === "running" || !state.hiddenJobIds.has(job.id);
+}
+
+function visibleJobs(jobs) {
+  return (jobs || []).filter(isJobVisible);
+}
+
+function pruneHiddenJobs(jobs) {
+  const ids = new Set((jobs || []).map((job) => job.id));
+  let changed = false;
+  for (const id of state.hiddenJobIds) {
+    if (!ids.has(id)) {
+      state.hiddenJobIds.delete(id);
+      changed = true;
+    }
+  }
+  if (changed) saveHiddenJobs();
 }
 
 function saveForm() {
@@ -151,9 +179,10 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
-function card(label, value, meta = "", tone = "") {
+function card(label, value, meta = "", tone = "", extraClass = "") {
   const toneClass = tone ? ` ${escapeHtml(tone)}` : "";
-  return `<div class="card${toneClass}">
+  const extra = extraClass ? ` ${escapeHtml(extraClass)}` : "";
+  return `<div class="card${toneClass}${extra}">
     <span class="card-label">${escapeHtml(label)}</span>
     <strong>${escapeHtml(value)}</strong>
     ${meta ? `<span class="card-meta">${escapeHtml(meta)}</span>` : ""}
@@ -165,13 +194,15 @@ function renderSummary(summary) {
   const conversationCount = summary.progress.conversationCount || summary.conversationFoldersCount;
   const totalSlides = summary.progress.totalSlides || 0;
   const sentSlides = summary.progress.sentSlides || 0;
+  const progressChanged = state.lastSentSlides !== null && sentSlides !== state.lastSentSlides;
   elements.summaryCards.innerHTML = [
     card("PDF 文件", summary.pdfs.length, summary.pdfs.length ? "可以写入插件" : "还没扫到 PDF", summary.pdfs.length ? "tone-sky" : "tone-muted"),
     card("PPT 文件", summary.ppts.length, summary.ppts.length ? "可生成截图" : "可只用 PDF", summary.ppts.length ? "tone-amber" : "tone-muted"),
     card("截图 Deck", summary.decks.length, summary.decks.length ? `${totalSlides} 页截图` : "需要准备截图", summary.decks.length ? "tone-mint" : "tone-warn"),
     card("Gemini 对话", conversationCount, conversationCount ? "已记录链接" : "还没记录对话", conversationCount ? "tone-sky" : "tone-muted"),
-    card("已问页数", totalSlides ? `${sentSlides}/${totalSlides}` : "0", totalSlides ? "按进度文件统计" : "暂无进度", totalSlides && sentSlides >= totalSlides ? "tone-mint" : "tone-muted"),
+    card("已问页数", totalSlides ? `${sentSlides}/${totalSlides}` : "0", totalSlides ? "按进度文件统计" : "暂无进度", totalSlides && sentSlides >= totalSlides ? "tone-mint" : "tone-muted", progressChanged ? "progress-bump" : ""),
   ].join("");
+  state.lastSentSlides = sentSlides;
 
   const deckRows = summary.decks.slice(0, 12).map((deck) => {
     return `<div class="detail-row">
@@ -193,14 +224,15 @@ function renderSummary(summary) {
 
 function renderJobs(jobs) {
   state.jobs = jobs;
+  const visible = visibleJobs(jobs);
   document.body.classList.toggle("has-running-job", jobs.some((job) => job.status === "running"));
-  if (!jobs.length) {
+  if (!visible.length) {
     elements.jobs.innerHTML = "<p>还没有任务。</p>";
     updateWorkflowState();
     return;
   }
 
-  elements.jobs.innerHTML = jobs.map((job) => {
+  elements.jobs.innerHTML = visible.map((job) => {
     const active = job.id === state.selectedJobId ? " is-selected" : "";
     return `<button class="job${active}" data-job="${job.id}" type="button">
       <div><strong>${escapeHtml(job.title)}</strong><br><small>${escapeHtml(job.startedAt)}${job.finishedAt ? ` -> ${escapeHtml(job.finishedAt)}` : ""}</small></div>
@@ -216,6 +248,7 @@ function renderJobs(jobs) {
 
 function clearSummary() {
   state.summary = null;
+  state.lastSentSlides = null;
   elements.summaryCards.innerHTML = "";
   elements.details.innerHTML = "<p>请先扫描当前学科文件夹。</p>";
   updateWorkflowState();
@@ -354,6 +387,7 @@ async function refreshState() {
     loadForm(data.defaults);
     state.formLoaded = true;
   }
+  pruneHiddenJobs(data.jobs);
   renderJobs(data.jobs);
   if (state.summary && elements.workspace.value.trim()) {
     await scan();
@@ -372,6 +406,36 @@ async function scan() {
   renderSummary(data.summary);
   setStatus("扫描完成");
   updateWorkflowState();
+}
+
+async function refreshSummaryProgress() {
+  if (!state.summary || state.summaryRefreshInFlight || !elements.workspace.value.trim()) return;
+  state.summaryRefreshInFlight = true;
+  try {
+    let data;
+    try {
+      data = await api("/api/progress/current", {
+        method: "POST",
+        body: JSON.stringify(payload()),
+      });
+    } catch (error) {
+      if (!String(error.message || "").includes("Not found")) throw error;
+      const scanData = await api("/api/scan", {
+        method: "POST",
+        body: JSON.stringify(payload()),
+      });
+      renderSummary(scanData.summary);
+      return;
+    }
+    renderSummary({
+      ...state.summary,
+      decks: data.result.decks || state.summary.decks,
+      progress: data.result.progress || state.summary.progress,
+      conversationFoldersCount: data.result.conversationFoldersCount ?? state.summary.conversationFoldersCount,
+    });
+  } finally {
+    state.summaryRefreshInFlight = false;
+  }
 }
 
 async function startJob(path, body = payload()) {
@@ -393,7 +457,12 @@ async function selectJob(id) {
 
 async function refreshJobsAndLog() {
   const data = await api("/api/jobs");
+  pruneHiddenJobs(data.jobs);
   renderJobs(data.jobs);
+  const hasRunningContentJob = data.jobs.some((job) => (
+    (job.type === "prepare" || job.type === "gemini")
+    && job.status === "running"
+  ));
   const justCompletedContentJob = data.jobs.find((job) => (
     (job.type === "prepare" || job.type === "gemini")
     && job.status === "complete"
@@ -402,11 +471,14 @@ async function refreshJobsAndLog() {
   if (justCompletedContentJob && state.summary) {
     state.refreshedJobIds.add(justCompletedContentJob.id);
     await scan();
+  } else if (hasRunningContentJob) {
+    await refreshSummaryProgress();
   }
-  if (state.selectedJobId && !data.jobs.some((job) => job.id === state.selectedJobId)) {
+  const selectableJobs = visibleJobs(data.jobs);
+  if (state.selectedJobId && !selectableJobs.some((job) => job.id === state.selectedJobId)) {
     state.selectedJobId = null;
   }
-  if (!state.selectedJobId && data.jobs.length) state.selectedJobId = data.jobs[0].id;
+  if (!state.selectedJobId && selectableJobs.length) state.selectedJobId = selectableJobs[0].id;
   if (state.selectedJobId) {
     const logData = await api(`/api/jobs/${encodeURIComponent(state.selectedJobId)}/log`);
     elements.log.textContent = logData.log || "暂无日志。";
@@ -486,6 +558,53 @@ async function clearSelectedLog() {
   setStatus("当前任务日志已清空");
 }
 
+async function clearFinishedJobs() {
+  let data;
+  try {
+    data = await api("/api/jobs/clear-finished", { method: "POST" });
+  } catch (error) {
+    if (String(error.message || "").includes("Not found")) {
+      const expiredJobs = (state.jobs || []).filter((job) => job.status !== "running");
+      for (const job of expiredJobs) state.hiddenJobIds.add(job.id);
+      saveHiddenJobs();
+      renderJobs(state.jobs);
+      const selectable = visibleJobs(state.jobs);
+      if (state.selectedJobId && !selectable.some((job) => job.id === state.selectedJobId)) {
+        state.selectedJobId = null;
+      }
+      if (!state.selectedJobId && selectable.length) state.selectedJobId = selectable[0].id;
+      if (state.selectedJobId) {
+        await refreshJobsAndLog();
+      } else {
+        elements.stopJob.disabled = true;
+        elements.log.textContent = "还没有任务日志。";
+      }
+      setStatus(expiredJobs.length ? `已清空 ${expiredJobs.length} 个过期任务` : "没有过期任务需要清空");
+      return;
+    }
+    throw error;
+  }
+  const nextJobs = data.jobs || [];
+  pruneHiddenJobs(nextJobs);
+  renderJobs(nextJobs);
+
+  if (state.selectedJobId && !nextJobs.some((job) => job.id === state.selectedJobId)) {
+    state.selectedJobId = null;
+  }
+  if (!state.selectedJobId && nextJobs.length) {
+    state.selectedJobId = nextJobs[0].id;
+  }
+
+  if (state.selectedJobId) {
+    await refreshJobsAndLog();
+  } else {
+    elements.stopJob.disabled = true;
+    elements.log.textContent = "还没有任务日志。";
+  }
+
+  setStatus(data.removed ? `已清空 ${data.removed} 个过期任务` : "没有过期任务需要清空");
+}
+
 async function writePluginConfig() {
   const job = await startJob("/api/jobs/plugin");
   const result = job.result || {};
@@ -525,6 +644,7 @@ elements.resetProgress.addEventListener("click", () => resetProgress().catch((er
 elements.updatePlugin.addEventListener("click", () => writePluginConfig().catch((error) => setStatus(error.message)));
 elements.stopJob.addEventListener("click", () => stopSelectedJob().catch((error) => setStatus(error.message)));
 elements.clearLog.addEventListener("click", () => clearSelectedLog().catch((error) => setStatus(error.message)));
+elements.clearFinishedJobs.addEventListener("click", () => clearFinishedJobs().catch((error) => setStatus(error.message)));
 
 state.pollTimer = setInterval(() => {
   refreshJobsAndLog().catch(() => {});

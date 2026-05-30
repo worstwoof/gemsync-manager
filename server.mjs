@@ -303,6 +303,35 @@ async function workspaceSummary(workspace) {
   };
 }
 
+async function workspaceProgress(workspace) {
+  const root = path.resolve(workspace || "");
+  const screenshotRoot = path.join(root, "gemini_ppt_screenshots_full");
+  const decks = await screenshotDecks(root);
+  const progress = await readJson(path.join(screenshotRoot, "gemini_progress.json"), {});
+  const conversationFolders = await readJson(path.join(screenshotRoot, "conversation_folders.json"), null);
+  const sent = progress?.sent || {};
+  const completedDeckCount = decks.filter((deck) => {
+    const sentSlides = Number(sent[deck.folder] || 0);
+    return deck.slides > 0 && sentSlides >= deck.slides;
+  }).length;
+  const sentSlides = decks.reduce((total, deck) => total + Number(sent[deck.folder] || 0), 0);
+  const totalSlides = decks.reduce((total, deck) => total + Number(deck.slides || 0), 0);
+  return {
+    decks,
+    progress: {
+      sentCount: progress?.sent ? Object.keys(progress.sent).length : 0,
+      completedDeckCount,
+      incompleteDeckCount: Math.max(0, decks.length - completedDeckCount),
+      sentSlides,
+      totalSlides,
+      conversationCount: progress?.conversations ? Object.keys(progress.conversations).length : 0,
+      last: progress?.last || null,
+      quotaWaiting: !!progress?.quotaWaiting,
+    },
+    conversationFoldersCount: Array.isArray(conversationFolders?.folders) ? conversationFolders.folders.length : 0,
+  };
+}
+
 async function extensionSubjects(extensionRoot) {
   const subjectsPath = path.join(extensionRoot, "pdf-panel", "subjects.json");
   const subjects = await readJson(subjectsPath, { version: 1, defaultSubject: "", subjects: [] });
@@ -1033,6 +1062,12 @@ async function handleApi(req, res, url) {
     return;
   }
 
+  if (url.pathname === "/api/progress/current" && req.method === "POST") {
+    const body = await readJsonBody(req);
+    sendJson(res, 200, { ok: true, result: await workspaceProgress(body.workspace) });
+    return;
+  }
+
   if (url.pathname === "/api/chrome/start" && req.method === "POST") {
     sendJson(res, 200, { ok: true, result: await startChromeDebug(await readJsonBody(req)) });
     return;
@@ -1055,6 +1090,18 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/jobs/plugin" && req.method === "POST") {
     sendJson(res, 200, { ok: true, job: publicJob(await updatePluginJob(await readJsonBody(req))) });
+    return;
+  }
+
+  if (url.pathname === "/api/jobs/clear-finished" && req.method === "POST") {
+    let removed = 0;
+    for (const [id, job] of jobs) {
+      if (job.status !== "running") {
+        jobs.delete(id);
+        removed += 1;
+      }
+    }
+    sendJson(res, 200, { ok: true, removed, jobs: [...jobs.values()].map(publicJob) });
     return;
   }
 

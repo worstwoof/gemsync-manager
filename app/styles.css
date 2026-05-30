@@ -321,7 +321,8 @@ label span {
   font-size: 12px;
 }
 
-.log-actions {
+.log-actions,
+.jobs-actions {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -611,6 +612,10 @@ button.quiet:hover {
   transform: translateY(-1px);
 }
 
+.card.progress-bump strong {
+  animation: progressBump 520ms ease;
+}
+
 .card.tone-sky::before {
   background: var(--sky);
 }
@@ -801,6 +806,18 @@ button.quiet:hover {
   }
 }
 
+@keyframes progressBump {
+  0%,
+  100% {
+    color: var(--ink);
+    transform: translateY(0);
+  }
+  35% {
+    color: var(--mint);
+    transform: translateY(-2px) scale(1.04);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -839,11 +856,13 @@ button.quiet:hover {
     width: 100%;
   }
 
-  .log-actions {
+  .log-actions,
+  .jobs-actions {
     width: 100%;
   }
 
-  .log-actions button {
+  .log-actions button,
+  .jobs-actions button {
     flex: 1;
   }
 
