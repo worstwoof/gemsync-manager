@@ -81,19 +81,6 @@ http://127.0.0.1:5188
 9. 重新加载 Chrome 插件。
 10. 打开 Gemini 页面，点击悬浮的 `PDF` 按钮，就可以在旁边看同步 PDF 面板。
 
-## 不会上传的本地文件
-
-下面这些文件和目录默认会被 `.gitignore` 忽略：
-
-- `logs/`
-- `outputs/`
-- `extension/pdf-panel/subjects.json`
-- `extension/pdf-panel/subjects/`
-- `gemini_ppt_screenshots_full/`
-- `chrome-gemini-automation-profile/`
-- 本地 `.env` 文件
-
-也就是说，公开仓库里只有干净的程序版本，不包含你的课程资料和 Gemini 聊天记录。
 
 ## 环境变量
 
