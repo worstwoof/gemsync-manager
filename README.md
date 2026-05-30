@@ -1,32 +1,32 @@
 # GemSync Manager
 
-GemSync Manager is a local Windows tool for studying with Gemini and PDFs side by side.
+GemSync Manager 是一个本地学习工具，用来把 Gemini 聊天记录和 PDF/PPT 页面同步到一起看。
 
-It does three things:
+它主要做三件事：
 
-1. Converts course PPT/PDF files into page screenshots.
-2. Sends those screenshots to Gemini one page at a time with your prompt.
-3. Writes a Chrome extension config so Gemini can open a synced PDF panel next to the chat.
+1. 把课程里的 PPT、PPTX 或 PDF 转成逐页截图。
+2. 自动把每一页截图发给 Gemini，让 Gemini 按你的提示词讲解。
+3. 生成 Chrome 插件配置，让你在 Gemini 页面旁边打开同步 PDF 面板。
 
-This public repo only contains the app and extension source code. Your course PDFs, Gemini conversation links, logs, and generated configs are local files and are ignored by git.
+这个公开仓库只包含程序源码、插件源码和示例配置。你的课程文件、Gemini 对话链接、日志、截图和本地配置都会留在你电脑上，不会被上传到 GitHub。
 
-## What You Need
+## 需要的环境
 
 - Windows 10/11
-- Node.js 20 or newer
+- Node.js 20 或更新版本
 - Google Chrome
-- Python 3, available as `python`
-- Poppler command line tools, especially `pdftoppm` and `pdfinfo`
-- LibreOffice, only needed when converting PPT/PPTX files
-- A Gemini account logged in inside the automation Chrome profile
+- Python 3，并且命令行里能运行 `python`
+- Poppler 命令行工具，至少需要 `pdftoppm` 和 `pdfinfo`
+- LibreOffice，只在需要转换 PPT/PPTX 时使用
+- 一个可以正常登录 Gemini 的账号
 
-Install Node dependencies:
+安装 Node 依赖：
 
 ```powershell
 npm install
 ```
 
-If `pdftoppm`, `pdfinfo`, `python`, or `node` are not on PATH, set environment variables before starting:
+如果 `node`、`python`、`pdftoppm` 或 `pdfinfo` 没有加入 PATH，可以在启动前设置环境变量：
 
 ```powershell
 $env:GEMSYNC_NODE = "C:\Path\To\node.exe"
@@ -35,96 +35,97 @@ $env:GEMSYNC_PDFTOPPM = "C:\Path\To\pdftoppm.exe"
 $env:GEMSYNC_PDFINFO = "C:\Path\To\pdfinfo.exe"
 ```
 
-## Start The Manager
+## 启动管理器
 
-From this folder:
+在仓库目录下运行：
 
 ```powershell
 .\start.ps1
 ```
 
-Or:
+也可以运行：
 
 ```powershell
 npm start
 ```
 
-Open:
+然后打开：
 
 ```text
 http://127.0.0.1:5188
 ```
 
-## Install The Chrome Extension
+## 安装 Chrome 插件
 
-1. Open `chrome://extensions`.
-2. Turn on Developer mode.
-3. Click **Load unpacked**.
-4. Select this folder:
+1. 打开 `chrome://extensions`。
+2. 打开右上角的“开发者模式”。
+3. 点击“加载已解压的扩展程序”。
+4. 选择这个目录：
 
 ```text
 <repo>\extension
 ```
 
-Refresh Gemini after loading or reloading the extension.
+加载或重新加载插件后，刷新 Gemini 页面。
 
-## Basic Workflow
+## 基本使用流程
 
-1. Start GemSync Manager.
-2. Choose a course folder that contains your PPT/PDF files.
-3. Click **Scan Folder**.
-4. Click **Prepare Screenshots** if screenshots do not exist yet.
-5. Click **Open Gemini Tab** and log in once if needed.
-6. Choose the Gemini model and prompt.
-7. Click **Start Gemini Auto Ask**.
-8. After Gemini finishes, click **Write To Extension**.
-9. Reload the Chrome extension.
-10. Open Gemini and use the floating `PDF` button to open the side PDF panel.
+1. 启动 GemSync Manager。
+2. 选择一门课所在的文件夹，里面可以放 PPT、PPTX 或 PDF。
+3. 点击“扫描文件夹”。
+4. 如果还没有截图，点击“准备截图”。
+5. 点击“打开 Gemini 标签页”，第一次使用时先登录 Gemini。
+6. 选择 Gemini 模型，并确认提示词。
+7. 点击“启动 Gemini 自动问”。
+8. 等 Gemini 全部讲完后，点击“写入插件”。
+9. 重新加载 Chrome 插件。
+10. 打开 Gemini 页面，点击悬浮的 `PDF` 按钮，就可以在旁边看同步 PDF 面板。
 
-## Local Files That Are Not Uploaded
+## 不会上传的本地文件
 
-These are intentionally ignored:
+下面这些文件和目录默认会被 `.gitignore` 忽略：
 
 - `logs/`
 - `outputs/`
 - `extension/pdf-panel/subjects.json`
 - `extension/pdf-panel/subjects/`
 - `gemini_ppt_screenshots_full/`
-- local `.env` files
+- `chrome-gemini-automation-profile/`
+- 本地 `.env` 文件
 
-That means public GitHub users get the clean app, not your course records.
+也就是说，公开仓库里只有干净的程序版本，不包含你的课程资料和 Gemini 聊天记录。
 
-## Environment Variables
+## 环境变量
 
-| Variable | Purpose |
+| 变量 | 作用 |
 | --- | --- |
-| `GEMSYNC_MANAGER_PORT` | Manager port. Default: `5188`. |
-| `GEMSYNC_NODE` | Node executable used by background jobs. Default: current Node or `node`. |
-| `GEMSYNC_PYTHON` | Python executable used for PPT conversion helpers. Default: `python`. |
-| `GEMSYNC_PDFINFO` | Path to `pdfinfo`. Default: `pdfinfo`. |
-| `GEMSYNC_PDFTOPPM` | Path to `pdftoppm`. Default: `pdftoppm`. |
-| `GEMSYNC_AUTOMATION_SCRIPTS` | Folder containing automation scripts. Default: `<repo>\scripts`. |
-| `GEMSYNC_DEFAULT_WORKSPACE` | Optional default course folder. |
-| `GEMSYNC_DEFAULT_PROMPT` | Optional default prompt. |
+| `GEMSYNC_MANAGER_PORT` | 管理器端口，默认是 `5188`。 |
+| `GEMSYNC_NODE` | 后台任务使用的 Node 程序，默认使用当前 Node 或 `node`。 |
+| `GEMSYNC_PYTHON` | PPT 转截图辅助脚本使用的 Python，默认是 `python`。 |
+| `GEMSYNC_PDFINFO` | `pdfinfo` 的路径，默认是 `pdfinfo`。 |
+| `GEMSYNC_PDFTOPPM` | `pdftoppm` 的路径，默认是 `pdftoppm`。 |
+| `GEMSYNC_AUTOMATION_SCRIPTS` | 自动化脚本目录，默认是 `<repo>\scripts`。 |
+| `GEMSYNC_DEFAULT_WORKSPACE` | 可选，默认课程文件夹。 |
+| `GEMSYNC_DEFAULT_PROMPT` | 可选，默认重复发送给 Gemini 的提示词。 |
 
-## Chrome Automation
+## Chrome 自动化说明
 
-Gemini automation connects to Chrome DevTools at:
+Gemini 自动提问需要连接 Chrome DevTools，默认地址是：
 
 ```text
 http://127.0.0.1:9222
 ```
 
-The manager can open an automation Chrome tab for you. If you start Chrome manually, use:
+管理器可以帮你打开自动化 Chrome 标签页。如果你想手动启动 Chrome，可以使用：
 
 ```powershell
 chrome.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\gemsync-chrome" https://gemini.google.com/app
 ```
 
-Log in to Gemini once in that Chrome profile.
+第一次使用时，需要在这个 Chrome 配置里登录 Gemini。
 
-## Notes
+## 使用提醒
 
-- Do not manually click Gemini send while the automation is running.
-- If a run fails, you can run it again. Progress is stored in the selected course folder.
-- PDF/PPT files stay local unless you explicitly send their screenshots to Gemini.
+- 自动提问运行时，不要手动点击 Gemini 的发送按钮。
+- 如果中途失败，可以重新运行，进度会保存在你选择的课程文件夹里。
+- PDF/PPT 文件本身不会自动上传到 GitHub。只有当你启动 Gemini 自动问时，程序才会把页面截图发给 Gemini。
