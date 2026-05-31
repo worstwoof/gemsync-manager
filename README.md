@@ -10,6 +10,22 @@ GemSync Manager 是一个本地学习工具，用来把 Gemini 聊天记录和 P
 
 这个公开仓库只包含程序源码、插件源码和示例配置。你的课程文件、Gemini 对话链接、日志、截图和本地配置都会留在你电脑上，不会被上传到 GitHub。
 
+## 界面预览
+
+下面的截图使用演示数据，不包含真实课程文件或 Gemini 对话记录。
+
+### 管理器主界面
+
+![GemSync Manager 管理器主界面，展示课程来源、自动提问设置和扫描结果](docs/screenshots/manager-overview.png)
+
+### 选择要生成的离线缓存
+
+![生成离线缓存步骤，展示已缓存、待缓存和无对话的 Deck 选择状态](docs/screenshots/offline-cache-selection.png)
+
+### 离线缓存阅读器
+
+![离线缓存阅读器，左侧是本地 Gemini 全记录，右侧是同步 PDF 面板](docs/screenshots/offline-reader.png)
+
 ## 需要的环境
 
 - Windows 10/11
