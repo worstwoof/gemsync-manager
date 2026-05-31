@@ -98,9 +98,11 @@ function Resolve-Tool {
 }
 
 function Refresh-Path {
+  $currentPath = $env:Path
   $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
   $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   $parts = @()
+  if ($currentPath) { $parts += $currentPath }
   if ($machinePath) { $parts += $machinePath }
   if ($userPath) { $parts += $userPath }
   $env:Path = ($parts -join ';')
@@ -149,10 +151,10 @@ function Get-MajorVersion {
 function Invoke-Version {
   param(
     [string]$Path,
-    [string[]]$Args
+    [string[]]$Arguments
   )
   try {
-    $output = & $Path @Args 2>$null | Select-Object -First 1
+    $output = & $Path @Arguments 2>$null | Select-Object -First 1
     if ($output) { return [string]$output }
   } catch {
     return ''
@@ -246,7 +248,7 @@ function Resolve-Node {
     if ($seen.ContainsKey($key)) { continue }
     $seen[$key] = $true
 
-    $version = Invoke-Version -Path $candidate -Args @('--version')
+    $version = Invoke-Version -Path $candidate -Arguments @('--version')
     if ((Get-MajorVersion $version) -gt 0) {
       return [pscustomobject]@{
         Path = $candidate
@@ -281,6 +283,31 @@ function Add-CommonPath {
   )
   if ($Base) { return $List + (Join-Path $Base $Child) }
   return $List
+}
+
+function Resolve-PowerPoint {
+  $registryPaths = @(
+    'Registry::HKEY_CLASSES_ROOT\PowerPoint.Application\CLSID',
+    'Registry::HKEY_CLASSES_ROOT\PowerPoint.Application.16\CLSID',
+    'Registry::HKEY_CLASSES_ROOT\PowerPoint.Application.15\CLSID',
+    'Registry::HKEY_CLASSES_ROOT\PowerPoint.Application.14\CLSID'
+  )
+  foreach ($registryPath in $registryPaths) {
+    if (Test-Path -LiteralPath $registryPath) {
+      return [pscustomobject]@{ Path = 'PowerPoint.Application COM' }
+    }
+  }
+
+  $common = @()
+  $common = Add-CommonPath $common $env:ProgramFiles 'Microsoft Office\root\Office*\POWERPNT.EXE'
+  $common = Add-CommonPath $common ${env:ProgramFiles(x86)} 'Microsoft Office\root\Office*\POWERPNT.EXE'
+  $common = Add-CommonPath $common $env:ProgramFiles 'Microsoft Office\Office*\POWERPNT.EXE'
+  $common = Add-CommonPath $common ${env:ProgramFiles(x86)} 'Microsoft Office\Office*\POWERPNT.EXE'
+  $powerPointPath = Resolve-CommonPath $common
+  if ($powerPointPath) {
+    return [pscustomobject]@{ Path = $powerPointPath }
+  }
+  return $null
 }
 
 Write-Info "Checking GemSync Manager environment..."
@@ -355,19 +382,27 @@ if ($pdfinfoPath -and $pdftoppmPath) {
   $Missing.Add('Poppler: pdfinfo + pdftoppm')
 }
 
+$powerPoint = Resolve-PowerPoint
+if ($powerPoint) {
+  $Results['PowerPoint'] = $powerPoint
+  Write-Ok "PowerPoint -> $($powerPoint.Path)"
+}
+
 $officeCommon = @()
 $officeCommon = Add-CommonPath $officeCommon $env:ProgramFiles 'LibreOffice\program\soffice.exe'
 $officeCommon = Add-CommonPath $officeCommon ${env:ProgramFiles(x86)} 'LibreOffice\program\soffice.exe'
 $officePath = Resolve-Tool -EnvName 'GEMSYNC_SOFFICE' -Commands @('soffice.exe', 'soffice', 'libreoffice') -CommonPaths $officeCommon
-if (-not $officePath) {
+if (-not $officePath -and -not $powerPoint) {
   Install-WingetPackage -Name 'LibreOffice' -PackageId 'TheDocumentFoundation.LibreOffice'
   $officePath = Resolve-Tool -EnvName 'GEMSYNC_SOFFICE' -Commands @('soffice.exe', 'soffice', 'libreoffice') -CommonPaths $officeCommon
 }
 if ($officePath) {
   $Results['LibreOffice'] = [pscustomobject]@{ Path = $officePath }
   Write-Ok "LibreOffice -> $officePath"
+} elseif ($powerPoint) {
+  Write-Info "LibreOffice was not found. PowerPoint will be used for PPT/PPTX conversion."
 } else {
-  Write-WarnLine "LibreOffice was not found. PPT/PPTX conversion will not work until it is installed."
+  Write-WarnLine "Neither PowerPoint nor LibreOffice was found. PPT/PPTX conversion will not work until one of them is installed."
 }
 
 $chromeCommon = @()
@@ -393,6 +428,7 @@ if (-not $CheckOnly) {
   if ($Results.Contains('Python')) { Set-GemSyncEnv 'GEMSYNC_PYTHON' $Results['Python'].Path }
   if ($Results.Contains('PdfInfo')) { Set-GemSyncEnv 'GEMSYNC_PDFINFO' $Results['PdfInfo'].Path }
   if ($Results.Contains('PdfToPpm')) { Set-GemSyncEnv 'GEMSYNC_PDFTOPPM' $Results['PdfToPpm'].Path }
+  if ($Results.Contains('LibreOffice')) { Set-GemSyncEnv 'GEMSYNC_SOFFICE' $Results['LibreOffice'].Path }
   if ($Results.Contains('Chrome')) { Set-GemSyncEnv 'GEMSYNC_CHROME' $Results['Chrome'].Path }
   Set-GemSyncEnv 'GEMSYNC_AUTOMATION_SCRIPTS' $automationScripts
 
@@ -404,6 +440,7 @@ if (-not $CheckOnly) {
   if ($Results.Contains('Python')) { $lines += '$env:GEMSYNC_PYTHON = ' + (Quote-PowerShellString $Results['Python'].Path) }
   if ($Results.Contains('PdfInfo')) { $lines += '$env:GEMSYNC_PDFINFO = ' + (Quote-PowerShellString $Results['PdfInfo'].Path) }
   if ($Results.Contains('PdfToPpm')) { $lines += '$env:GEMSYNC_PDFTOPPM = ' + (Quote-PowerShellString $Results['PdfToPpm'].Path) }
+  if ($Results.Contains('LibreOffice')) { $lines += '$env:GEMSYNC_SOFFICE = ' + (Quote-PowerShellString $Results['LibreOffice'].Path) }
   if ($Results.Contains('Chrome')) { $lines += '$env:GEMSYNC_CHROME = ' + (Quote-PowerShellString $Results['Chrome'].Path) }
   $lines += '$env:GEMSYNC_AUTOMATION_SCRIPTS = ' + (Quote-PowerShellString $automationScripts)
   Set-Content -LiteralPath $LocalEnvPath -Value $lines -Encoding UTF8

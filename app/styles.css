@@ -571,6 +571,80 @@ label span {
   width: 122px;
 }
 
+.cache-deck-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.cache-deck-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #dde9e8;
+  border-radius: var(--radius);
+  background: #fbfefe;
+  padding: 8px 9px;
+}
+
+.cache-deck-option.is-disabled {
+  opacity: 0.62;
+}
+
+.cache-deck-option input {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.cache-deck-option span {
+  min-width: 0;
+}
+
+.cache-deck-option strong,
+.cache-deck-option small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cache-deck-option strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.cache-deck-option small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.cache-deck-option em {
+  border-radius: 999px;
+  background: #e8f0f2;
+  color: #50636d;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.cache-deck-option.is-cached em {
+  background: #def5e8;
+  color: #28744d;
+}
+
+.cache-deck-empty {
+  margin: 0;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--muted);
+  padding: 10px;
+  font-size: 12px;
+}
+
 button.quiet {
   min-height: 34px;
   background: #fbfefe;
@@ -700,6 +774,16 @@ button.quiet:hover {
 .deck-badge {
   color: #2e6f83;
   background: #e1f3f8;
+}
+
+.pending-row {
+  border-color: #ead3ad;
+  background: #fffaf1;
+}
+
+.pending-badge {
+  color: #7a5510;
+  background: #f8e7c5;
 }
 
 .badge.complete {

@@ -26,6 +26,8 @@ const DEFAULT_WORKSPACE = process.env.GEMSYNC_DEFAULT_WORKSPACE || "";
 const DEFAULT_SUBJECT_ID = process.env.GEMSYNC_DEFAULT_SUBJECT_ID || "";
 const DEFAULT_SUBJECT_TITLE = process.env.GEMSYNC_DEFAULT_SUBJECT_TITLE || "";
 const DEFAULT_PROMPT = process.env.GEMSYNC_DEFAULT_PROMPT || "请详细讲解这一面PPT";
+const DEFAULT_PRE_PROMPT = process.env.GEMSYNC_DEFAULT_PRE_PROMPT || "";
+const DEFAULT_PAGES_PER_PROMPT = normalizePagesPerPrompt(process.env.GEMSYNC_DEFAULT_PAGES_PER_PROMPT || 1);
 const DEFAULT_GEMINI_MODEL = "pro";
 const DEFAULT_PRO_FALLBACK = "flash";
 const CHROME_DEBUG_URL = "http://127.0.0.1:9222";
@@ -34,9 +36,18 @@ const GEMINI_URL = "https://gemini.google.com/app";
 const MIME = new Map([
   [".html", "text/html; charset=utf-8"],
   [".js", "text/javascript; charset=utf-8"],
+  [".mjs", "text/javascript; charset=utf-8"],
   [".css", "text/css; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
   [".svg", "image/svg+xml"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".pdf", "application/pdf"],
+  [".woff", "font/woff"],
+  [".woff2", "font/woff2"],
+  [".ttf", "font/ttf"],
+  [".wasm", "application/wasm"],
 ]);
 
 const jobs = new Map();
@@ -143,6 +154,18 @@ function normalizeProFallback(input, fallback = DEFAULT_PRO_FALLBACK) {
   return fallback;
 }
 
+function bodyString(body, key, fallback = "") {
+  if (Object.prototype.hasOwnProperty.call(body || {}, key)) {
+    return String(body[key] || "").trim();
+  }
+  return String(fallback || "").trim();
+}
+
+function normalizePagesPerPrompt(value, fallback = 1) {
+  const number = Math.floor(Number(value) || Number(fallback) || 1);
+  return Math.max(1, Math.min(3, number));
+}
+
 function deckIdFromNumber(number) {
   return `deck${String(number).padStart(2, "0")}`;
 }
@@ -177,6 +200,68 @@ function comparableName(input) {
     .replace(/[()[\]{}（）【】《》,，.。:：;；]/g, "");
 }
 
+function isIgnoredOfficeTemp(file) {
+  return path.basename(file || "").startsWith("~$");
+}
+
+function manifestItemsFromValue(manifest) {
+  if (Array.isArray(manifest)) return manifest;
+  if (Array.isArray(manifest?.decks)) return manifest.decks;
+  if (Array.isArray(manifest?.items)) return manifest.items;
+  return [];
+}
+
+function findUnscreenedPpts(ppts, manifestItems, decks) {
+  const exactSourcePaths = new Set(
+    manifestItems
+      .map((item) => String(item?.sourcePath || "").trim())
+      .filter(Boolean)
+      .map((file) => path.resolve(file).toLowerCase()),
+  );
+  const legacyNameAllowances = new Map();
+  const manifestDeckNumbers = new Set();
+  const seenManifestSources = new Set();
+
+  for (const item of manifestItems) {
+    if (!item || item.sourcePath) continue;
+    const source = String(item.source || "").trim();
+    const key = comparableName(path.basename(source));
+    if (!key) continue;
+    const deckKey = String(item.deckIndex || item.deck || item.folder || source);
+    const unique = `${deckKey}:${key}`;
+    if (seenManifestSources.has(unique)) continue;
+    seenManifestSources.add(unique);
+    legacyNameAllowances.set(key, (legacyNameAllowances.get(key) || 0) + 1);
+    if (String(item.deckIndex || "").match(/^\d+$/)) manifestDeckNumbers.add(Number(item.deckIndex));
+  }
+
+  if (!manifestItems.length) {
+    for (const deck of decks) {
+      const key = comparableName(deck.title || deck.folder || "");
+      if (!key) continue;
+      legacyNameAllowances.set(key, (legacyNameAllowances.get(key) || 0) + 1);
+    }
+  } else {
+    for (const deck of decks) {
+      if (manifestDeckNumbers.has(Number(deck.deckNumber || 0))) continue;
+      const key = comparableName(deck.title || deck.folder || "");
+      if (!key) continue;
+      legacyNameAllowances.set(key, (legacyNameAllowances.get(key) || 0) + 1);
+    }
+  }
+
+  return ppts.filter((file) => {
+    if (exactSourcePaths.has(path.resolve(file).toLowerCase())) return false;
+    const key = comparableName(path.basename(file));
+    const allowance = legacyNameAllowances.get(key) || 0;
+    if (allowance > 0) {
+      legacyNameAllowances.set(key, allowance - 1);
+      return false;
+    }
+    return true;
+  });
+}
+
 function conversationIdFromUrl(url) {
   try {
     return new URL(url).pathname.match(/^\/app\/([^/?#]+)/)?.[1] || "";
@@ -196,13 +281,88 @@ function withZh(url) {
   }
 }
 
-async function listFiles(dir, extensions) {
+function isPathWithin(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function shouldSkipSourceDir(name) {
+  const lower = String(name || "").toLowerCase();
+  return lower === "gemini_ppt_screenshots_full"
+    || lower === "chrome-gemini-automation-profile"
+    || lower === "node_modules"
+    || lower === ".git";
+}
+
+async function listFiles(dir, extensions, options = {}) {
+  const root = path.resolve(dir || "");
+  const recursive = !!options.recursive;
+  const excludeDirNames = new Set((options.excludeDirNames || []).map((name) => String(name).toLowerCase()));
+  const excludeDirs = (options.excludeDirs || []).map((item) => path.resolve(item));
+  const results = [];
+
+  async function walk(current) {
+    let entries;
+    try {
+      entries = await fsp.readdir(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const file = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (!recursive) continue;
+        const lower = entry.name.toLowerCase();
+        const excluded = excludeDirNames.has(lower)
+          || excludeDirs.some((excludedDir) => file === excludedDir || isPathWithin(excludedDir, file));
+        if (excluded) continue;
+        await walk(file);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (!extensions.includes(path.extname(file).toLowerCase())) continue;
+      if (isIgnoredOfficeTemp(file)) continue;
+      results.push(file);
+    }
+  }
+
+  await walk(root);
+  return results.sort((a, b) => {
+    const relativeA = path.relative(root, a) || path.basename(a);
+    const relativeB = path.relative(root, b) || path.basename(b);
+    return relativeA.localeCompare(relativeB, "zh-Hans-CN", { numeric: true });
+  });
+}
+
+async function workspaceSourceFiles(workspace, extensions) {
+  return listFiles(workspace, extensions, {
+    recursive: true,
+    excludeDirNames: [
+      "gemini_ppt_screenshots_full",
+      "chrome-gemini-automation-profile",
+      "node_modules",
+      ".git",
+    ],
+  });
+}
+
+async function workspacePptFiles(workspace) {
+  return workspaceSourceFiles(workspace, [".ppt", ".pptx"]);
+}
+
+async function workspaceUserPdfFiles(workspace) {
+  return workspaceSourceFiles(workspace, [".pdf"]);
+}
+
+async function listFilesFlat(dir, extensions) {
   try {
     const entries = await fsp.readdir(dir, { withFileTypes: true });
     return entries
       .filter((entry) => entry.isFile())
       .map((entry) => path.join(dir, entry.name))
       .filter((file) => extensions.includes(path.extname(file).toLowerCase()))
+      .filter((file) => !isIgnoredOfficeTemp(file))
       .sort((a, b) => path.basename(a).localeCompare(path.basename(b), "zh-Hans-CN", { numeric: true }));
   } catch {
     return [];
@@ -213,7 +373,7 @@ async function workspacePdfFiles(workspace) {
   const root = path.resolve(workspace || "");
   const screenshotRoot = path.join(root, "gemini_ppt_screenshots_full");
   const pdfs = [
-    ...(await listFiles(root, [".pdf"])),
+    ...(await workspaceUserPdfFiles(root)),
     ...(await listFiles(path.join(screenshotRoot, "_pdf"), [".pdf"])),
   ];
   return Array.from(new Set(pdfs))
@@ -229,6 +389,7 @@ async function screenshotDecks(workspace) {
       if (!entry.isDirectory() || !/^deck\d+_/i.test(entry.name)) continue;
       const folder = path.join(root, entry.name);
       const pngs = await listFiles(folder, [".png"]);
+      if (!pngs.length) continue;
       decks.push({
         folder: entry.name,
         folderPath: folder,
@@ -257,22 +418,77 @@ async function countPdfPages(file) {
   });
 }
 
-async function workspaceSummary(workspace) {
+async function subjectCacheSummary(workspace, body = {}) {
+  const title = normalizeTitle(body.title, folderTitleFromPath(workspace) || DEFAULT_SUBJECT_TITLE);
+  const requestedSubjectId = sanitizeId(body.subjectId, title);
+  const extension = await extensionSubjects(DEFAULT_EXTENSION_ROOT);
+  const requestedTitleKey = subjectTitleKey(title);
+  const subject = extension.subjects.find((item) => subjectTitleKey(item.title) === requestedTitleKey)
+    || extension.subjects.find((item) => item.id === requestedSubjectId)
+    || null;
+  const subjectId = subject?.id || requestedSubjectId;
+  const configPath = subject ? configPathForSubject(DEFAULT_EXTENSION_ROOT, subject) : path.join(DEFAULT_EXTENSION_ROOT, "pdf-panel", "subjects", subjectId, "config.json");
+  const config = await readJson(configPath, null);
+  const decks = Array.isArray(config?.decks) ? config.decks : [];
+  let transcriptDeckCount = 0;
+  let recordCount = 0;
+  let interactiveViewCount = 0;
+  const deckSummaries = [];
+
+  for (const deck of decks) {
+    const transcriptPath = deck.transcriptUrl ? path.resolve(path.dirname(configPath), deck.transcriptUrl) : "";
+    const transcript = transcriptPath ? await readJson(transcriptPath, null) : null;
+    const records = Array.isArray(transcript?.records) ? transcript.records : [];
+    const deckInteractiveViews = Number(transcript?.interactiveViewCount || 0)
+      || records.reduce((total, record) => total + (Array.isArray(record.interactiveViews) ? record.interactiveViews.length : 0), 0);
+    const cacheExists = !!transcript;
+
+    if (cacheExists) {
+      transcriptDeckCount += 1;
+      recordCount += records.length;
+      interactiveViewCount += deckInteractiveViews;
+    }
+
+    deckSummaries.push({
+      id: deck.id || "",
+      title: deck.title || deck.id || "",
+      totalPages: Number(deck.totalPages || 0),
+      geminiUrl: deck.geminiUrl || "",
+      conversationId: deck.conversationId || conversationIdFromUrl(deck.geminiUrl),
+      transcriptUrl: deck.transcriptUrl || "",
+      cacheExists,
+      recordCount: records.length,
+      interactiveViewCount: deckInteractiveViews,
+      cacheUrl: cacheExists
+        ? `/pdf-panel/cached-split.html#subject=${encodeURIComponent(subjectId)}&deck=${encodeURIComponent(deck.id || "")}`
+        : "",
+    });
+  }
+
+  return {
+    subjectId,
+    configExists: !!config,
+    totalDecks: decks.length,
+    transcriptDeckCount,
+    recordCount,
+    interactiveViewCount,
+    openCacheUrl: deckSummaries.find((deck) => deck.cacheExists)?.cacheUrl || "",
+    decks: deckSummaries,
+  };
+}
+
+async function workspaceSummary(workspace, body = {}) {
   const root = path.resolve(workspace || "");
   const pdfs = await workspacePdfFiles(root);
-  const ppts = await listFiles(root, [".ppt", ".pptx"]);
+  const ppts = await workspacePptFiles(root);
   const screenshotRoot = path.join(root, "gemini_ppt_screenshots_full");
   const decks = await screenshotDecks(root);
   const progress = await readJson(path.join(screenshotRoot, "gemini_progress.json"), {});
   const conversationFolders = await readJson(path.join(screenshotRoot, "conversation_folders.json"), null);
   const manifest = await readJson(path.join(screenshotRoot, "manifest.json"), null);
-  const manifestItems = Array.isArray(manifest)
-    ? manifest
-    : Array.isArray(manifest?.decks)
-      ? manifest.decks
-      : Array.isArray(manifest?.items)
-        ? manifest.items
-        : [];
+  const manifestItems = manifestItemsFromValue(manifest);
+  const unscreenedPpts = findUnscreenedPpts(ppts, manifestItems, decks);
+  const unscreenedSet = new Set(unscreenedPpts);
   const sent = progress?.sent || {};
   const completedDeckCount = decks.filter((deck) => {
     const sentSlides = Number(sent[deck.folder] || 0);
@@ -280,14 +496,39 @@ async function workspaceSummary(workspace) {
   }).length;
   const sentSlides = decks.reduce((total, deck) => total + Number(sent[deck.folder] || 0), 0);
   const totalSlides = decks.reduce((total, deck) => total + Number(deck.slides || 0), 0);
+  const cache = await subjectCacheSummary(root, body);
+  const cacheByDeck = new Map((cache.decks || []).map((deck) => [deck.id, deck]));
+  const decksWithState = decks.map((deck, index) => {
+    const id = deckIdFromNumber(deck.deckNumber || index + 1);
+    const conversationUrl = withZh(findConversationForDeck(deck, index, progress, conversationFolders));
+    const cached = cacheByDeck.get(id) || null;
+    const sentSlides = Number(sent[deck.folder] || 0);
+    return {
+      ...deck,
+      id,
+      sentSlides,
+      complete: deck.slides > 0 && sentSlides >= deck.slides,
+      conversationUrl,
+      geminiUrl: cached?.geminiUrl || conversationUrl,
+      conversationId: cached?.conversationId || conversationIdFromUrl(conversationUrl),
+      cache: cached,
+    };
+  });
+
   return {
     workspace: root,
     exists: fs.existsSync(root),
     pdfs: pdfs.map((file) => ({ name: path.basename(file), path: file })),
-    ppts: ppts.map((file) => ({ name: path.basename(file), path: file })),
+    ppts: ppts.map((file) => ({
+      name: path.basename(file),
+      path: file,
+      screened: !unscreenedSet.has(file),
+    })),
+    unscreenedPpts: unscreenedPpts.map((file) => ({ name: path.basename(file), path: file })),
+    screenedPptCount: Math.max(0, ppts.length - unscreenedPpts.length),
     screenshotRoot,
     screenshotRootExists: fs.existsSync(screenshotRoot),
-    decks,
+    decks: decksWithState,
     progress: {
       sentCount: progress?.sent ? Object.keys(progress.sent).length : 0,
       completedDeckCount,
@@ -300,6 +541,7 @@ async function workspaceSummary(workspace) {
     },
     conversationFoldersCount: Array.isArray(conversationFolders?.folders) ? conversationFolders.folders.length : 0,
     manifestCount: manifestItems.length,
+    cache,
   };
 }
 
@@ -415,9 +657,12 @@ async function ensureRunner(workspace) {
 async function prepareScreenshotsJob(body) {
   const workspace = path.resolve(body.workspace || "");
   if (!fs.existsSync(workspace)) throw new Error("学科文件夹不存在");
-  const ppts = await listFiles(workspace, [".ppt", ".pptx"]);
+  const ppts = await workspacePptFiles(workspace);
   const pdfs = await workspacePdfFiles(workspace);
   const decks = await screenshotDecks(workspace);
+  const screenshotRoot = path.join(workspace, "gemini_ppt_screenshots_full");
+  const manifest = await readJson(path.join(screenshotRoot, "manifest.json"), null);
+  const unscreenedPpts = findUnscreenedPpts(ppts, manifestItemsFromValue(manifest), decks);
 
   if (!ppts.length && pdfs.length) return preparePdfScreenshotsJob(workspace, pdfs, decks);
 
@@ -426,7 +671,7 @@ async function prepareScreenshotsJob(body) {
   if (body.dryRun) args.push("--dry-run");
   const requestedPpts = Array.isArray(body.ppts) && body.ppts.length
     ? body.ppts
-    : (!decks.length ? ppts : []);
+    : (!decks.length ? ppts : unscreenedPpts);
   for (const ppt of requestedPpts) args.push("--ppt", ppt);
   return runJob({
     type: "prepare",
@@ -557,9 +802,11 @@ async function startGeminiJob(body) {
   const env = {
     GEMINI_PPT_ROOT: screenshotRoot,
     GEMINI_PPT_PROMPT: body.prompt || DEFAULT_PROMPT,
+    GEMINI_PAGES_PER_PROMPT: String(normalizePagesPerPrompt(body.pagesPerPrompt, DEFAULT_PAGES_PER_PROMPT)),
     GEMINI_MODEL: normalizeModel(body.model),
     GEMINI_PRO_FALLBACK: normalizeProFallback(body.proFallback),
   };
+  if (String(body.prePrompt || "").trim()) env.GEMINI_PRE_PROMPT = String(body.prePrompt).trim();
   if (body.maxSlides) env.MAX_SLIDES = String(body.maxSlides);
   return runJob({
     type: "gemini",
@@ -601,6 +848,7 @@ async function resetGeminiProgress(body) {
     sent: {},
     conversations: {},
     renamedTitles: {},
+    renameResults: {},
     resetAt: now,
     updatedAt: now,
   });
@@ -685,6 +933,10 @@ function configPathForSubject(extensionRoot, subject) {
 function comparablePluginConfig(config) {
   return {
     course: subjectTitleKey(config?.course || ""),
+    pagePrompt: String(config?.pagePrompt || "").trim(),
+    prePrompt: String(config?.prePrompt || "").trim(),
+    promptStartIndex: Number(config?.promptStartIndex || 1),
+    pagesPerPrompt: normalizePagesPerPrompt(config?.pagesPerPrompt || 1),
     decks: (config?.decks || []).map((deck) => ({
       id: deck.id || "",
       title: String(deck.title || "").trim(),
@@ -795,6 +1047,10 @@ async function buildPluginSubject(body) {
   const summary = await workspaceSummary(workspace);
   const screenshotRoot = path.join(workspace, "gemini_ppt_screenshots_full");
   const progress = await readJson(path.join(screenshotRoot, "gemini_progress.json"), {});
+  const pagePrompt = bodyString(body, "prompt", progress.modelSettings?.prompt || DEFAULT_PROMPT) || DEFAULT_PROMPT;
+  const prePrompt = bodyString(body, "prePrompt", progress.modelSettings?.prePrompt || DEFAULT_PRE_PROMPT);
+  const pagesPerPrompt = normalizePagesPerPrompt(body.pagesPerPrompt, progress.modelSettings?.pagesPerPrompt || DEFAULT_PAGES_PER_PROMPT);
+  const promptStartIndex = prePrompt ? 2 : 1;
   let conversationFolders = await readJson(path.join(screenshotRoot, "conversation_folders.json"), null);
   const pdfs = await workspacePdfFiles(workspace);
   const decks = summary.decks.length
@@ -819,12 +1075,16 @@ async function buildPluginSubject(body) {
   const subjectId = existingSubject?.id || requestedSubjectId;
   const subjectRoot = path.join(extensionRoot, "pdf-panel", "subjects", subjectId);
   const pdfDir = path.join(subjectRoot, "pdfs");
+  const configPath = path.join(subjectRoot, "config.json");
+  const existingConfigPath = configPathForSubject(extensionRoot, existingSubject);
+  const existingConfig = existingConfigPath ? await readJson(existingConfigPath, null) : null;
 
   const configDecks = [];
   const pdfCopies = [];
   for (let index = 0; index < decks.length; index += 1) {
     const deck = decks[index];
     const deckId = deckIdFromNumber(deck.deckNumber || index + 1);
+    const existingDeck = (existingConfig?.decks || []).find((item) => item.id === deckId);
     const sourcePdf = findPdfForDeck(pdfs, deck, index);
     if (!sourcePdf) {
       appendJob(body.job || { log: "" }, `WARN no PDF for ${deck.folder}\n`);
@@ -841,6 +1101,7 @@ async function buildPluginSubject(body) {
       geminiUrl,
       conversationId: conversationIdFromUrl(geminiUrl),
       totalPages,
+      ...(existingDeck?.transcriptUrl ? { transcriptUrl: existingDeck.transcriptUrl } : {}),
     });
   }
 
@@ -849,13 +1110,18 @@ async function buildPluginSubject(body) {
   const config = {
     version: 1,
     course: title,
-    pagePrompt: DEFAULT_PROMPT,
+    pagePrompt,
+    prePrompt,
+    promptStartIndex,
+    pagesPerPrompt,
     decks: configDecks,
   };
-  const configPath = path.join(subjectRoot, "config.json");
-  const existingConfigPath = configPathForSubject(extensionRoot, existingSubject);
-  const existingConfig = existingConfigPath ? await readJson(existingConfigPath, null) : null;
-  const alreadyImported = !!existingConfig && samePluginConfig(existingConfig, config);
+  const missingPromptMetadata = !!existingConfig && (
+    !Object.prototype.hasOwnProperty.call(existingConfig, "prePrompt")
+    || !Object.prototype.hasOwnProperty.call(existingConfig, "promptStartIndex")
+    || !Object.prototype.hasOwnProperty.call(existingConfig, "pagesPerPrompt")
+  );
+  const alreadyImported = !!existingConfig && samePluginConfig(existingConfig, config) && !missingPromptMetadata;
   const entry = {
     id: subjectId,
     title,
@@ -883,6 +1149,10 @@ async function buildPluginSubject(body) {
     configPath,
     conversationFoldersPath: path.join(screenshotRoot, "conversation_folders.json"),
     decks: configDecks.length,
+    pagePrompt,
+    prePrompt,
+    promptStartIndex,
+    pagesPerPrompt,
     missingGeminiUrls: configDecks.filter((deck) => !deck.geminiUrl).length,
     alreadyImported,
     reusedExistingSubject: !!existingSubject && existingSubject.id !== requestedSubjectId,
@@ -916,6 +1186,93 @@ async function updatePluginJob(body) {
   } finally {
     job.finishedAt = new Date().toISOString();
   }
+  return job;
+}
+
+async function cacheGeminiTranscriptsJob(body) {
+  const workspace = path.resolve(body.workspace || "");
+  if (!fs.existsSync(workspace)) throw new Error("学科文件夹不存在");
+  const selectedDecks = Array.isArray(body.cacheDecks)
+    ? body.cacheDecks.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const requestedDecks = selectedDecks.length
+    ? selectedDecks
+    : (body.onlyDeck ? [String(body.onlyDeck).trim()].filter(Boolean) : []);
+  if (Array.isArray(body.cacheDecks) && !selectedDecks.length) {
+    throw new Error("请先勾选至少一个要生成离线缓存的对话");
+  }
+
+  const existingCacheSummary = await subjectCacheSummary(workspace, body);
+  if (existingCacheSummary.configExists) {
+    const existingById = new Map((existingCacheSummary.decks || []).map((deck) => [deck.id, deck]));
+    const requestedForExisting = requestedDecks.length
+      ? requestedDecks
+      : (existingCacheSummary.decks || []).filter((deck) => deck.geminiUrl).map((deck) => deck.id);
+    const stillNeedsCache = requestedForExisting.filter((id) => {
+      const deck = existingById.get(id);
+      return !deck || (deck.geminiUrl && !deck.cacheExists);
+    });
+    if (requestedForExisting.length && !stillNeedsCache.length) {
+      throw new Error("已全部缓存，没有未缓存的 Gemini 对话需要生成");
+    }
+  }
+
+  const pluginResult = await buildPluginSubject(body);
+  const cacheSummary = await subjectCacheSummary(workspace, { ...body, subjectId: pluginResult.subjectId, title: pluginResult.title });
+  const uncachedIds = new Set((cacheSummary.decks || [])
+    .filter((deck) => deck.geminiUrl && !deck.cacheExists)
+    .map((deck) => deck.id));
+  const deckIdsToGenerate = requestedDecks.length
+    ? requestedDecks.filter((id) => uncachedIds.has(id))
+    : [...uncachedIds];
+  if (!deckIdsToGenerate.length) {
+    throw new Error("已全部缓存，没有未缓存的 Gemini 对话需要生成");
+  }
+  const screenshotRoot = path.join(workspace, "gemini_ppt_screenshots_full");
+  await fsp.mkdir(screenshotRoot, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14);
+  const log = path.join(screenshotRoot, `manager_cache_${stamp}.log`);
+  const script = resolveAutomationScript("cache_gemini_subject.mjs");
+
+  const job = runJob({
+    type: "cache",
+    title: "生成离线缓存",
+    command: NODE,
+    args: [
+      script,
+      "--workspace",
+      workspace,
+      "--subject-id",
+      pluginResult.subjectId,
+      "--title",
+      pluginResult.title,
+      "--extension-root",
+      DEFAULT_EXTENSION_ROOT,
+      "--chrome",
+      CHROME_DEBUG_URL,
+      "--prompt",
+      bodyString(body, "prompt", DEFAULT_PROMPT) || DEFAULT_PROMPT,
+      "--pre-prompt",
+      pluginResult.prePrompt || "",
+      "--prompt-start-index",
+      String(pluginResult.promptStartIndex || 1),
+      "--pages-per-prompt",
+      String(pluginResult.pagesPerPrompt || 1),
+      ...(deckIdsToGenerate.length ? ["--only-decks", deckIdsToGenerate.join(",")] : []),
+    ],
+    cwd: ROOT,
+    logFiles: [log],
+  });
+  job.result = {
+    subjectId: pluginResult.subjectId,
+    title: pluginResult.title,
+    subjectRoot: pluginResult.subjectRoot,
+    configPath: pluginResult.configPath,
+    selectedDecks: deckIdsToGenerate,
+    cacheUrl: `/pdf-panel/cached-split.html#subject=${encodeURIComponent(pluginResult.subjectId)}${deckIdsToGenerate[0] ? `&deck=${encodeURIComponent(deckIdsToGenerate[0])}` : ""}`,
+    log,
+  };
+  appendJob(job, `PLUGIN_READY ${pluginResult.title} -> ${pluginResult.subjectId}\n`);
   return job;
 }
 
@@ -1032,7 +1389,9 @@ async function handleApi(req, res, url) {
         workspace: DEFAULT_WORKSPACE,
         subjectId: DEFAULT_SUBJECT_ID,
         subjectTitle: DEFAULT_SUBJECT_TITLE,
+        prePrompt: DEFAULT_PRE_PROMPT,
         prompt: DEFAULT_PROMPT,
+        pagesPerPrompt: DEFAULT_PAGES_PER_PROMPT,
         model: DEFAULT_GEMINI_MODEL,
         proFallback: DEFAULT_PRO_FALLBACK,
         extensionRoot: DEFAULT_EXTENSION_ROOT,
@@ -1058,7 +1417,7 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/scan" && req.method === "POST") {
     const body = await readJsonBody(req);
-    sendJson(res, 200, { ok: true, summary: await workspaceSummary(body.workspace) });
+    sendJson(res, 200, { ok: true, summary: await workspaceSummary(body.workspace, body) });
     return;
   }
 
@@ -1090,6 +1449,11 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/jobs/plugin" && req.method === "POST") {
     sendJson(res, 200, { ok: true, job: publicJob(await updatePluginJob(await readJsonBody(req))) });
+    return;
+  }
+
+  if (url.pathname === "/api/jobs/cache" && req.method === "POST") {
+    sendJson(res, 200, { ok: true, job: publicJob(await cacheGeminiTranscriptsJob(await readJsonBody(req))) });
     return;
   }
 
@@ -1163,8 +1527,12 @@ function serveStatic(req, res, url) {
     return;
   }
   if (pathname === "/") pathname = "/index.html";
-  const file = path.resolve(APP_ROOT, `.${pathname}`);
-  if (!file.startsWith(APP_ROOT)) return notFound(res);
+  const panelPrefix = "/pdf-panel/";
+  const servingPdfPanel = pathname.startsWith(panelPrefix);
+  const staticRoot = servingPdfPanel ? path.join(DEFAULT_EXTENSION_ROOT, "pdf-panel") : APP_ROOT;
+  const relativePath = servingPdfPanel ? pathname.slice(panelPrefix.length - 1) : pathname;
+  const file = path.resolve(staticRoot, `.${relativePath}`);
+  if (!file.startsWith(staticRoot)) return notFound(res);
   fs.readFile(file, (error, data) => {
     if (error) return notFound(res);
     send(res, 200, data, {

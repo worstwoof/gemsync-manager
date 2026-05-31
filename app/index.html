@@ -74,10 +74,22 @@
                 <option value="stop">停止任务</option>
               </select>
             </label>
+            <label>
+              <span>每次提问页数</span>
+              <select id="pagesPerPrompt">
+                <option value="1">1 页</option>
+                <option value="2">2 页</option>
+                <option value="3">3 页</option>
+              </select>
+            </label>
           </div>
           <label>
             <span>重复发送的提示词</span>
             <textarea id="promptText" rows="3">请详细讲解这一面PPT</textarea>
+          </label>
+          <label>
+            <span>对话开头预提示词</span>
+            <textarea id="prePromptText" rows="3" placeholder="可选。每个新 Gemini 对话开头只发送一次，用来说明后续回答风格。"></textarea>
           </label>
         </div>
       </section>
@@ -133,10 +145,23 @@
           <div class="step-item final-step" data-step="plugin">
             <div class="step-index">5</div>
             <div class="step-copy">
-              <div class="step-title"><strong>写入插件</strong><span class="step-tag final">最后一步</span></div>
+              <div class="step-title"><strong>写入插件</strong><span class="step-tag final">先写入</span></div>
               <span>把 PDF、Gemini 对话链接和页数写进插件。写完后重新加载 Chrome 扩展。</span>
             </div>
             <button id="updatePlugin" type="button" class="primary">写入插件</button>
+          </div>
+
+          <div class="step-item" data-step="cache">
+            <div class="step-index">6</div>
+            <div class="step-copy">
+              <div class="step-title"><strong>生成离线缓存</strong><span class="step-tag long">长任务</span></div>
+              <span>把 Gemini 完整聊天、Markdown、LaTeX、代码和动态组件保存到本地缓存版。</span>
+              <div id="cacheDeckList" class="cache-deck-list"></div>
+            </div>
+            <div class="step-actions">
+              <button id="cacheGemini" type="button">生成缓存</button>
+              <button id="openCache" type="button" class="quiet">打开缓存</button>
+            </div>
           </div>
         </div>
         <div id="workflowHint" class="workflow-hint">先选择或确认学科文件夹，然后扫描。</div>

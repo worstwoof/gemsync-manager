@@ -75,6 +75,8 @@ const root = path.resolve(process.env.GEMINI_PPT_ROOT || path.join(process.cwd()
 const progressPath = path.resolve(process.env.GEMINI_PROGRESS_PATH || path.join(root, 'gemini_progress.json'));
 const conversationFoldersPath = path.resolve(process.env.GEMINI_CONVERSATION_FOLDERS_PATH || path.join(root, 'conversation_folders.json'));
 const promptText = process.env.GEMINI_PPT_PROMPT || '\u8bf7\u8be6\u7ec6\u8bb2\u89e3\u8fd9\u4e00\u9762PPT';
+const prePromptText = String(process.env.GEMINI_PRE_PROMPT || '').trim();
+const pagesPerPrompt = Math.max(1, Math.min(3, Math.floor(Number(process.env.GEMINI_PAGES_PER_PROMPT || '1') || 1)));
 const maxSlides = Number(process.env.MAX_SLIDES || '0');
 const quotaCheckIntervalMs = Number(process.env.QUOTA_CHECK_INTERVAL_MS || '300000');
 const quotaRefreshBufferMs = Number(process.env.QUOTA_REFRESH_BUFFER_MS || '60000');
@@ -201,12 +203,32 @@ async function getGeminiPage() {
   return { browser, page };
 }
 
-async function waitForInput(page) {
-  await page.locator('div[role="textbox"][contenteditable="true"]').last().waitFor({ state: 'visible', timeout: 45000 });
+async function waitForInput(page, timeout = composerReadyTimeoutMs) {
+  await page.locator('div[role="textbox"][contenteditable="true"]').last().waitFor({ state: 'visible', timeout });
+}
+
+async function gotoGemini(page, url, label) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`NAV_WARN ${label} domcontentloaded_timeout current="${page.url()}" message="${message.replace(/\s+/g, ' ').slice(0, 240)}"`);
+  }
+
+  if (!page.url().includes('gemini.google.com')) {
+    try {
+      await page.goto(url, { waitUntil: 'commit', timeout: 30000 });
+      console.log(`NAV_RECOVER ${label} committed current="${page.url()}"`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log(`NAV_RECOVER_FAILED ${label} current="${page.url()}" message="${message.replace(/\s+/g, ' ').slice(0, 240)}"`);
+    }
+  }
 }
 
 async function openNewChat(page) {
-  await page.goto('https://gemini.google.com/app', { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await gotoGemini(page, 'https://gemini.google.com/app', 'new_chat');
   await waitForInput(page);
 }
 
@@ -507,16 +529,16 @@ async function waitForComposerImageCount(page, expectedCount, timeoutMs = 60000)
   return await getComposerState(page);
 }
 
-async function waitForPreparedComposer(page, prompt, { timeoutMs = composerReadyTimeoutMs, stableTarget = 8 } = {}) {
+async function waitForPreparedComposer(page, prompt, { timeoutMs = composerReadyTimeoutMs, stableTarget = 8, expectedImageCount = 1 } = {}) {
   const started = Date.now();
   let lastState = null;
   let stableCount = 0;
   while (Date.now() - started < timeoutMs) {
     lastState = await getComposerState(page);
-    if (lastState.imagePreviewCount > 1) {
+    if (lastState.imagePreviewCount > expectedImageCount) {
       return { ok: false, reason: 'too_many_images', state: lastState };
     }
-    if (lastState.imagePreviewCount === 1 && promptMatches(lastState.text, prompt) && lastState.sendReady) {
+    if (lastState.imagePreviewCount === expectedImageCount && promptMatches(lastState.text, prompt) && lastState.sendReady) {
       stableCount += 1;
       if (stableCount >= stableTarget) return { ok: true, state: lastState, stableCount };
     } else {
@@ -560,7 +582,7 @@ async function waitForUploadPreviewStable(page, expectedCount, { timeoutMs = 900
 
 async function reloadCurrentConversation(page) {
   const url = page.url();
-  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await gotoGemini(page, url, 'reload_current_conversation');
   await waitForInput(page);
   await sleep(1500);
 }
@@ -569,22 +591,23 @@ function shouldReloadBeforeRetry(reason) {
   return /^upload_preview_count_/.test(reason || '')
     || reason === 'too_many_images'
     || reason === 'composer_not_ready'
+    || String(reason || '').startsWith('upload_file_chooser_failed')
     || String(reason || '').startsWith('composer_not_clean')
     || String(reason || '').startsWith('final_composer_not_ready')
     || reason === 'composer_not_cleared_after_send';
 }
 
-async function reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, reason) {
+async function reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, reason, expectedImageCount = 1) {
   console.log(`RECOVER_RELOAD_AFTER_SEND ${deck} slide ${slideNumber}/${totalSlides} reason=${reason || 'unknown'}`);
   await reloadCurrentConversation(page);
   const answerAudit = await inspectLatestAnswer(page, prompt);
   console.log(`SELF_CHECK after_reload ${deck} slide ${slideNumber}/${totalSlides} hasAnswer=${answerAudit.hasAnswer} hasUserImage=${answerAudit.hasUserImage} userImages=${answerAudit.userImageCount || 0} missingImage=${answerAudit.missingImage}`);
 
-  if (answerAudit.hasAnswer && answerAudit.hasUserImage && !answerAudit.missingImage) {
+  if (answerAudit.hasAnswer && answerAudit.hasUserImage && !answerAudit.missingImage && Number(answerAudit.userImageCount || 0) >= expectedImageCount) {
     return { done: true, quotaWait: false, recoveredByReload: true };
   }
 
-  if (answerAudit.hasAnswer && (!answerAudit.hasUserImage || answerAudit.missingImage)) {
+  if (answerAudit.hasAnswer && (!answerAudit.hasUserImage || answerAudit.missingImage || Number(answerAudit.userImageCount || 0) < expectedImageCount)) {
     return { done: false, quotaWait: false, retry: true, reason: 'gemini_missing_image_after_reload' };
   }
 
@@ -1223,21 +1246,226 @@ function deckTitle(deck) {
     .trim();
 }
 
-function buildPrompt(deck, slideNumber, totalSlides) {
-  return promptText;
+function buildPrompt(deck, slideNumber, totalSlides, endSlideNumber = slideNumber) {
+  const start = Math.max(1, Number(slideNumber) || 1);
+  const end = Math.max(start, Number(endSlideNumber) || start);
+  if (end <= start) return promptText;
+  return `${promptText}\n\n本次上传的是第 ${start}-${end} 页 PPT，请按页码顺序分别讲解。`;
+}
+
+async function sendPrePrompt(page, deck, progress) {
+  if (!prePromptText) return { done: true, skipped: true };
+  await waitForInput(page);
+  await ensureConfiguredModel(page, progress, 'before_pre_prompt');
+
+  const existingComposer = await getComposerState(page);
+  console.log(`PRE_PROMPT composer_before ${deck} text_len=${existingComposer.text.length} images=${existingComposer.imagePreviewCount}`);
+  if (existingComposer.text || existingComposer.imagePreviewCount > 0) {
+    await clearComposer(page);
+  }
+
+  const clearedComposer = await getComposerState(page);
+  if (clearedComposer.text || clearedComposer.imagePreviewCount > 0) {
+    return { done: false, retry: true, reason: `pre_prompt_composer_not_clean text_len=${clearedComposer.text.length} images=${clearedComposer.imagePreviewCount}` };
+  }
+
+  await typePrompt(page, prePromptText);
+  const beforeSend = await ensureConfiguredModel(page, progress, 'before_pre_prompt_send');
+  if (beforeSend.waited || beforeSend.reloaded) {
+    return { done: false, retry: true, reason: 'quota_wait_before_pre_prompt_send' };
+  }
+
+  const prepared = await waitForPreparedComposer(page, prePromptText, { stableTarget: 10, expectedImageCount: 0 });
+  console.log(`PRE_PROMPT before_send ${deck} ok=${prepared.ok} reason=${prepared.reason || 'ok'} text_len=${prepared.state?.text?.length || 0} images=${prepared.state?.imagePreviewCount ?? 0}`);
+  if (!prepared.ok) {
+    await clearComposer(page).catch(() => {});
+    return { done: false, retry: true, reason: prepared.reason || 'pre_prompt_not_ready' };
+  }
+
+  const finalPrepared = await getComposerState(page);
+  if (finalPrepared.imagePreviewCount !== 0 || !promptMatches(finalPrepared.text, prePromptText) || !finalPrepared.sendReady) {
+    await clearComposer(page).catch(() => {});
+    return { done: false, retry: true, reason: `pre_prompt_final_not_ready text_len=${finalPrepared.text.length} images=${finalPrepared.imagePreviewCount} sendReady=${finalPrepared.sendReady || false}` };
+  }
+
+  await clickSendButton(page);
+  const submitted = await waitForComposerSubmitted(page);
+  console.log(`PRE_PROMPT after_send ${deck} ok=${submitted.ok} reason=${submitted.reason || 'ok'}`);
+  if (!submitted.ok) {
+    await clearComposer(page).catch(() => {});
+    return { done: false, retry: true, reason: submitted.reason || 'pre_prompt_not_submitted' };
+  }
+
+  return waitForAnswerDone(page);
+}
+
+async function ensurePrePromptSent(page, deck, progress) {
+  if (!prePromptText) return;
+  progress.prePrompts ??= {};
+  const prior = progress.prePrompts[deck];
+  if (prior?.done && prior.text === prePromptText) {
+    console.log(`PRE_PROMPT skip ${deck}`);
+    return;
+  }
+
+  for (let attempt = 1; attempt <= maxSendAttempts + 1; attempt += 1) {
+    console.log(`PRE_PROMPT send ${deck} attempt=${attempt}/${maxSendAttempts + 1}`);
+    progress.lastPrePrompt = {
+      deck,
+      done: false,
+      text: prePromptText,
+      attempt,
+      updatedAt: new Date().toISOString(),
+      url: page.url(),
+    };
+    await writeProgress(progress);
+
+    const result = await sendPrePrompt(page, deck, progress);
+    if (result.retry) {
+      console.log(`PRE_PROMPT retry ${deck} reason=${result.reason || 'unknown'}`);
+      if (attempt > maxSendAttempts) {
+        throw new Error(`Pre-prompt self-check failed too many times on ${deck}: ${result.reason || 'unknown'}`);
+      }
+      if (shouldReloadBeforeRetry(result.reason)) {
+        await reloadCurrentConversation(page);
+      }
+      continue;
+    }
+
+    if (result.quotaWait) {
+      progress.quotaWaiting = true;
+      progress.quotaReason = 'pre_prompt';
+      progress.quotaMode = result.mode;
+      await writeProgress(progress);
+      console.log(`PRE_PROMPT quota_pause ${deck} mode="${result.mode?.text || 'unknown'}"`);
+      await ensureConfiguredModel(page, progress, 'resume_after_pre_prompt_quota');
+      continue;
+    }
+
+    if (!result.done) {
+      throw new Error(`Timed out waiting for Gemini pre-prompt answer on ${deck}.`);
+    }
+
+    progress.prePrompts[deck] = {
+      done: true,
+      text: prePromptText,
+      url: page.url(),
+      sentAt: new Date().toISOString(),
+    };
+    progress.lastPrePrompt = {
+      deck,
+      done: true,
+      text: prePromptText,
+      updatedAt: new Date().toISOString(),
+      url: page.url(),
+    };
+    await writeProgress(progress);
+    console.log(`PRE_PROMPT done ${deck}`);
+    return;
+  }
+}
+
+async function clickConversationActions(page) {
+  const primarySelectors = [
+    '[aria-label*="\u5bf9\u8bdd\u64cd\u4f5c\u83dc\u5355"]',
+    '[data-test-id="conversation-actions-menu-icon-button"]',
+    '[aria-label*="Conversation"][aria-label*="action" i]',
+  ];
+  for (const selector of primarySelectors) {
+    const button = page.locator(selector).first();
+    if (await button.waitFor({ state: 'visible', timeout: 45000 }).then(() => true).catch(() => false)) {
+      await button.click({ timeout: 15000 });
+      return true;
+    }
+  }
+
+  const selectors = [
+    '[aria-label*="More"][aria-label*="option" i]',
+    '[aria-label*="更多"]',
+    '[aria-label*="选项"]',
+    '[aria-label*="菜单"]',
+  ];
+  for (const selector of selectors) {
+    const button = page.locator(selector).first();
+    if (await button.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await button.click({ timeout: 15000 });
+      return true;
+    }
+  }
+  return await page.evaluate(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0
+        && rect.height > 0
+        && style.display !== 'none'
+        && style.visibility !== 'hidden';
+    };
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+    const target = buttons.find((element) => {
+      const label = `${element.getAttribute('aria-label') || ''} ${(element.innerText || element.textContent || '').trim()} ${element.getAttribute('data-test-id') || ''}`;
+      return /conversation.*action|more.*option|more/i.test(label)
+        || label.includes('conversation-actions')
+        || label.includes('\u66f4\u591a')
+        || label.includes('\u9009\u9879')
+        || label.includes('\u83dc\u5355');
+    });
+    if (!target) return false;
+    target.click();
+    return true;
+  });
+}
+
+async function clickRenameMenuItem(page) {
+  const selectors = [
+    '[data-test-id="rename-button"]',
+    '[aria-label*="Rename" i]',
+    '[aria-label*="\u91cd\u547d\u540d"]',
+  ];
+  for (const selector of selectors) {
+    const item = page.locator(selector).first();
+    if (await item.waitFor({ state: 'visible', timeout: 5000 }).then(() => true).catch(() => false)) {
+      await item.click({ timeout: 15000 });
+      return true;
+    }
+  }
+  return await page.evaluate(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return rect.width > 0
+        && rect.height > 0
+        && style.display !== 'none'
+        && style.visibility !== 'hidden';
+    };
+    const items = Array.from(document.querySelectorAll('button, [role="menuitem"], [role="button"]')).filter(visible);
+    const target = items.find((element) => {
+      const label = `${element.getAttribute('aria-label') || ''} ${(element.innerText || element.textContent || '').trim()} ${element.getAttribute('data-test-id') || ''}`;
+      return /rename/i.test(label) || label.includes('\u91cd\u547d\u540d') || label.includes('rename-button');
+    });
+    if (!target) return false;
+    target.click();
+    return true;
+  });
 }
 
 async function renameCurrentConversation(page, title) {
   try {
-    await page.locator('[data-test-id="conversation-actions-menu-icon-button"]').waitFor({ state: 'visible', timeout: 45000 });
-    await page.locator('[data-test-id="conversation-actions-menu-icon-button"]').click({ timeout: 15000 });
-    await page.locator('[data-test-id="rename-button"]').click({ timeout: 15000 });
-    const input = page.locator('[data-test-id="edit-title-input"]').first();
+    await waitForInput(page);
+    const actionsOpened = await clickConversationActions(page);
+    if (!actionsOpened) return { ok: false, changed: false, reason: 'actions_menu_not_found' };
+    await sleep(600);
+    const renameClicked = await clickRenameMenuItem(page);
+    if (!renameClicked) {
+      const buttons = await visibleButtonSummary(page);
+      return { ok: false, changed: false, reason: `rename_menu_item_not_found buttons="${buttons}"` };
+    }
+    const input = page.locator('[data-test-id="edit-title-input"], input[type="text"], textarea').first();
     await input.waitFor({ state: 'visible', timeout: 15000 });
     const currentTitle = (await input.inputValue({ timeout: 15000 })).trim();
     if (currentTitle === title) {
       await page.keyboard.press('Escape').catch(() => {});
-      return false;
+      return { ok: true, changed: false, reason: 'already_named', currentTitle };
     }
     await input.fill(title, { timeout: 15000 });
     await page.locator('[data-test-id="save-button"]').click({ timeout: 5000 }).catch(async () => {
@@ -1258,12 +1486,41 @@ async function renameCurrentConversation(page, title) {
       });
     });
     await sleep(1500);
-    return true;
+    return { ok: true, changed: true, reason: 'saved', currentTitle };
   } catch (error) {
     console.log(`RENAME_FAILED title="${title}" message="${error instanceof Error ? error.message : String(error)}"`);
     await page.keyboard.press('Escape').catch(() => {});
-    return false;
+    return { ok: false, changed: false, reason: error instanceof Error ? error.message : String(error) };
   }
+}
+
+function isConversationRenameVerified(progress, deck, title = deckTitle(deck)) {
+  const result = progress.renameResults?.[deck];
+  return !!result?.ok && result.title === title;
+}
+
+async function ensureConversationRenamed(page, deck, progress, reason) {
+  const title = deckTitle(deck);
+  progress.renameResults ??= {};
+  progress.renamedTitles ??= {};
+  if (isConversationRenameVerified(progress, deck, title)) {
+    console.log(`RENAME skip ${deck} title="${title}" verified=true reason=${reason}`);
+    return { ok: true, changed: false, skipped: true, reason: 'already_verified' };
+  }
+
+  const result = await renameCurrentConversation(page, title);
+  progress.renameResults[deck] = {
+    ...result,
+    title,
+    reason,
+    url: page.url(),
+    updatedAt: new Date().toISOString(),
+  };
+  if (result.ok) progress.renamedTitles[deck] = title;
+  else if (progress.renamedTitles[deck] === title) delete progress.renamedTitles[deck];
+  await writeProgress(progress);
+  console.log(`RENAME ${deck} title="${title}" ok=${result.ok} changed=${result.changed || false} reason="${result.reason || reason}"`);
+  return result;
 }
 
 async function hasAnswerAfterLastPrompt(page) {
@@ -1357,8 +1614,30 @@ async function inspectLatestAnswer(page, prompt) {
       'please upload',
       'upload the image',
     ];
+    const strongMissingImagePhrases = [
+      '\u6ca1\u6709\u770b\u5230\u56fe\u7247',
+      '\u6ca1\u770b\u5230\u56fe\u7247',
+      '\u672a\u770b\u5230\u56fe\u7247',
+      '\u6ca1\u6709\u770b\u5230\u56fe\u50cf',
+      '\u65e0\u6cd5\u770b\u5230\u56fe\u7247',
+      '\u65e0\u6cd5\u67e5\u770b\u56fe\u7247',
+      '\u6ca1\u6709\u6536\u5230\u56fe\u7247',
+      '\u6ca1\u6709\u4e0a\u4f20\u56fe\u7247',
+      '\u6ca1\u6709\u9644\u4e0a\u56fe\u7247',
+      '\u8bf7\u4e0a\u4f20\u56fe\u7247',
+      '\u8bf7\u63d0\u4f9b\u56fe\u7247',
+      '\u6ca1\u6709\u770b\u5230ppt',
+      '\u672a\u770b\u5230ppt',
+      '\u6ca1\u6709\u770b\u5230\u5e7b\u706f\u7247',
+      'did not receive the image',
+      "can't see the image",
+      'cannot see the image',
+      'please upload the image',
+    ];
     const imageWords = /ppt|\u56fe\u7247|\u56fe\u50cf|\u5e7b\u706f\u7247|image|slide|upload/i.test(answerText);
-    const missingImage = imageWords && (userImageCount === 0 || missingPhrases.some((phrase) => lower.includes(phrase.toLowerCase())));
+    const broadMissing = missingPhrases.some((phrase) => lower.includes(phrase.toLowerCase()));
+    const strongMissing = strongMissingImagePhrases.some((phrase) => lower.includes(phrase.toLowerCase()));
+    const missingImage = imageWords && (userImageCount === 0 ? broadMissing : strongMissing);
     return {
       hasPrompt: true,
       hasAnswer: answerText.length > 80,
@@ -1370,30 +1649,39 @@ async function inspectLatestAnswer(page, prompt) {
   }, prompt);
 }
 
-async function sendSlide(page, deck, slidePath, slideNumber, totalSlides) {
-  const prompt = buildPrompt(deck, slideNumber, totalSlides);
+async function sendSlideBatch(page, deck, slidePaths, slideNumber, endSlideNumber, totalSlides) {
+  const expectedImageCount = slidePaths.length;
+  const rangeLabel = slideNumber === endSlideNumber ? `${slideNumber}` : `${slideNumber}-${endSlideNumber}`;
+  const prompt = buildPrompt(deck, slideNumber, totalSlides, endSlideNumber);
   await waitForInput(page);
   await ensureConfiguredModel(page, progress, 'before_upload');
   const existingComposer = await getComposerState(page);
-  console.log(`SELF_CHECK composer_before ${deck} slide ${slideNumber}/${totalSlides} text_len=${existingComposer.text.length} images=${existingComposer.imagePreviewCount}`);
+  console.log(`SELF_CHECK composer_before ${deck} slides ${rangeLabel}/${totalSlides} text_len=${existingComposer.text.length} images=${existingComposer.imagePreviewCount}`);
   if (existingComposer.text || existingComposer.imagePreviewCount > 0) {
-    console.log(`SELF_CHECK clear_stale_composer ${deck} slide ${slideNumber}/${totalSlides} text_len=${existingComposer.text.length} images=${existingComposer.imagePreviewCount}`);
+    console.log(`SELF_CHECK clear_stale_composer ${deck} slides ${rangeLabel}/${totalSlides} text_len=${existingComposer.text.length} images=${existingComposer.imagePreviewCount}`);
     await clearComposer(page);
   }
   const clearedComposer = await getComposerState(page);
   if (clearedComposer.text || clearedComposer.imagePreviewCount > 0) {
     return { done: false, quotaWait: false, retry: true, reason: `composer_not_clean text_len=${clearedComposer.text.length} images=${clearedComposer.imagePreviewCount}` };
   }
-  await uploadOne(page, slidePath);
+  for (let index = 0; index < slidePaths.length; index += 1) {
+    try {
+      await uploadOne(page, slidePaths[index]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { done: false, quotaWait: false, retry: true, reason: `upload_file_chooser_failed ${message.replace(/\s+/g, ' ').slice(0, 180)}` };
+    }
+  }
   if (slideNumber === 1 && firstSlideUploadSettleMs > 0) {
-    console.log(`FIRST_SLIDE_UPLOAD_BUFFER ${deck} slide ${slideNumber}/${totalSlides} wait_ms=${firstSlideUploadSettleMs}`);
+    console.log(`FIRST_SLIDE_UPLOAD_BUFFER ${deck} slides ${rangeLabel}/${totalSlides} wait_ms=${firstSlideUploadSettleMs}`);
     await sleep(firstSlideUploadSettleMs);
   }
-  const uploadState = await waitForUploadPreviewStable(page, 1, {
+  const uploadState = await waitForUploadPreviewStable(page, expectedImageCount, {
     stableTarget: slideNumber === 1 ? 16 : 8,
   });
-  console.log(`SELF_CHECK upload ${deck} slide ${slideNumber}/${totalSlides} images=${uploadState.imagePreviewCount} previewImages=${uploadState.previewImageCount} removeButtons=${uploadState.removeButtonCount} stable=${uploadState.stableCount || 0}`);
-  if (uploadState.imagePreviewCount !== 1) {
+  console.log(`SELF_CHECK upload ${deck} slides ${rangeLabel}/${totalSlides} images=${uploadState.imagePreviewCount} previewImages=${uploadState.previewImageCount} removeButtons=${uploadState.removeButtonCount} stable=${uploadState.stableCount || 0}`);
+  if (uploadState.imagePreviewCount !== expectedImageCount) {
     await clearComposer(page).catch(() => {});
     return { done: false, quotaWait: false, retry: true, reason: `upload_preview_count_${uploadState.imagePreviewCount}` };
   }
@@ -1404,30 +1692,31 @@ async function sendSlide(page, deck, slidePath, slideNumber, totalSlides) {
   }
   const prepared = await waitForPreparedComposer(page, prompt, {
     stableTarget: slideNumber === 1 ? 20 : 10,
+    expectedImageCount,
   });
-  console.log(`SELF_CHECK before_send ${deck} slide ${slideNumber}/${totalSlides} ok=${prepared.ok} reason=${prepared.reason || 'ok'} stable=${prepared.stableCount || 0} text_len=${prepared.state?.text?.length || 0} images=${prepared.state?.imagePreviewCount ?? 0} sendReady=${prepared.state?.sendReady || false}`);
+  console.log(`SELF_CHECK before_send ${deck} slides ${rangeLabel}/${totalSlides} ok=${prepared.ok} reason=${prepared.reason || 'ok'} stable=${prepared.stableCount || 0} text_len=${prepared.state?.text?.length || 0} images=${prepared.state?.imagePreviewCount ?? 0} sendReady=${prepared.state?.sendReady || false}`);
   if (!prepared.ok) {
     await clearComposer(page).catch(() => {});
     return { done: false, quotaWait: false, retry: true, reason: prepared.reason || 'composer_not_ready' };
   }
   const beforeClickWaitMs = slideNumber === 1 ? firstSlidePreSendSettleMs : preSendSettleMs;
   if (beforeClickWaitMs > 0) {
-    console.log(`PRE_SEND_BUFFER ${deck} slide ${slideNumber}/${totalSlides} wait_ms=${beforeClickWaitMs}`);
+    console.log(`PRE_SEND_BUFFER ${deck} slides ${rangeLabel}/${totalSlides} wait_ms=${beforeClickWaitMs}`);
     await sleep(beforeClickWaitMs);
   }
   const finalPrepared = await getComposerState(page);
-  console.log(`SELF_CHECK final_before_send ${deck} slide ${slideNumber}/${totalSlides} text_len=${finalPrepared.text.length} images=${finalPrepared.imagePreviewCount} sendReady=${finalPrepared.sendReady || false}`);
-  if (finalPrepared.imagePreviewCount !== 1 || !promptMatches(finalPrepared.text, prompt) || !finalPrepared.sendReady) {
+  console.log(`SELF_CHECK final_before_send ${deck} slides ${rangeLabel}/${totalSlides} text_len=${finalPrepared.text.length} images=${finalPrepared.imagePreviewCount} sendReady=${finalPrepared.sendReady || false}`);
+  if (finalPrepared.imagePreviewCount !== expectedImageCount || !promptMatches(finalPrepared.text, prompt) || !finalPrepared.sendReady) {
     await clearComposer(page).catch(() => {});
     return { done: false, quotaWait: false, retry: true, reason: `final_composer_not_ready text_len=${finalPrepared.text.length} images=${finalPrepared.imagePreviewCount} sendReady=${finalPrepared.sendReady || false}` };
   }
   await clickSendButton(page);
   const submitted = await waitForComposerSubmitted(page);
-  console.log(`SELF_CHECK after_send ${deck} slide ${slideNumber}/${totalSlides} ok=${submitted.ok} reason=${submitted.reason || 'ok'} text_len=${submitted.state?.text?.length || 0} images=${submitted.state?.imagePreviewCount ?? 0}`);
+  console.log(`SELF_CHECK after_send ${deck} slides ${rangeLabel}/${totalSlides} ok=${submitted.ok} reason=${submitted.reason || 'ok'} text_len=${submitted.state?.text?.length || 0} images=${submitted.state?.imagePreviewCount ?? 0}`);
   if (!submitted.ok) {
-    const recovered = await reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, submitted.reason || 'composer_not_submitted')
+    const recovered = await reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, submitted.reason || 'composer_not_submitted', expectedImageCount)
       .catch((error) => {
-        console.log(`RECOVER_RELOAD_FAILED ${deck} slide ${slideNumber}/${totalSlides} message="${error instanceof Error ? error.message : String(error)}"`);
+        console.log(`RECOVER_RELOAD_FAILED ${deck} slides ${rangeLabel}/${totalSlides} message="${error instanceof Error ? error.message : String(error)}"`);
         return null;
       });
     if (recovered) return recovered;
@@ -1437,15 +1726,15 @@ async function sendSlide(page, deck, slidePath, slideNumber, totalSlides) {
   const answerResult = await waitForAnswerDone(page);
   if (answerResult.done) {
     const answerAudit = await inspectLatestAnswer(page, prompt);
-    console.log(`SELF_CHECK answer ${deck} slide ${slideNumber}/${totalSlides} hasAnswer=${answerAudit.hasAnswer} hasUserImage=${answerAudit.hasUserImage} userImages=${answerAudit.userImageCount || 0} missingImage=${answerAudit.missingImage}`);
-    if (!answerAudit.hasUserImage || answerAudit.missingImage) {
+    console.log(`SELF_CHECK answer ${deck} slides ${rangeLabel}/${totalSlides} hasAnswer=${answerAudit.hasAnswer} hasUserImage=${answerAudit.hasUserImage} userImages=${answerAudit.userImageCount || 0} missingImage=${answerAudit.missingImage}`);
+    if (!answerAudit.hasUserImage || answerAudit.missingImage || Number(answerAudit.userImageCount || 0) < expectedImageCount) {
       return { done: false, quotaWait: false, retry: true, reason: 'gemini_missing_image' };
     }
   }
   if (!answerResult.done && !answerResult.quotaWait) {
-    const recovered = await reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, 'answer_timeout')
+    const recovered = await reloadAndAuditLatestAnswer(page, prompt, deck, slideNumber, totalSlides, 'answer_timeout', expectedImageCount)
       .catch((error) => {
-        console.log(`RECOVER_RELOAD_FAILED ${deck} slide ${slideNumber}/${totalSlides} message="${error instanceof Error ? error.message : String(error)}"`);
+        console.log(`RECOVER_RELOAD_FAILED ${deck} slides ${rangeLabel}/${totalSlides} message="${error instanceof Error ? error.message : String(error)}"`);
         return null;
       });
     if (recovered) return recovered;
@@ -1455,14 +1744,17 @@ async function sendSlide(page, deck, slidePath, slideNumber, totalSlides) {
 
 const progress = await readProgress();
 progress.renamedTitles ??= {};
+progress.renameResults ??= {};
 progress.modelSettings = {
   requestedModel,
   proFallback,
   prompt: promptText,
+  prePrompt: prePromptText,
+  pagesPerPrompt,
   updatedAt: new Date().toISOString(),
 };
 await writeProgress(progress);
-console.log(`MODEL_SETTINGS requested=${requestedModel} pro_fallback=${proFallback} prompt="${promptText}"`);
+console.log(`MODEL_SETTINGS requested=${requestedModel} pro_fallback=${proFallback} pages_per_prompt=${pagesPerPrompt} prompt="${promptText}" pre_prompt_len=${prePromptText.length}`);
 const decks = await listDecks();
 const { browser, page } = await getGeminiPage();
 
@@ -1472,6 +1764,15 @@ try {
   for (const deck of decks) {
     const slides = await listSlides(deck);
     let sent = progress.sent[deck] || 0;
+    if (progress.last?.deck === deck && progress.last.done === false) {
+      const retryFrom = Math.max(0, Number(progress.last.slideStart || progress.last.slide || sent + 1) - 1);
+      if (retryFrom < sent) {
+        sent = retryFrom;
+        progress.sent[deck] = sent;
+        await writeProgress(progress);
+      }
+      console.log(`REWIND incomplete ${deck} to slide ${sent + 1}/${slides.length}`);
+    }
     if (progress.last?.deck === deck && progress.last.done === false && progress.last.slide === sent) {
       sent = Math.max(0, sent - 1);
       progress.sent[deck] = sent;
@@ -1480,13 +1781,18 @@ try {
     }
     if (sent >= slides.length) {
       console.log(`SKIP complete ${deck} (${sent}/${slides.length})`);
+      if (progress.conversations[deck] && !isConversationRenameVerified(progress, deck)) {
+        await gotoGemini(page, progress.conversations[deck], `rename_complete_${deck}`);
+        await waitForInput(page);
+        await ensureConversationRenamed(page, deck, progress, 'complete_deck_verify');
+      }
       await updateConversationFolderIndex(progress, deck, slides, progress.conversations[deck]);
       continue;
     }
 
-    if (sent > 0 && progress.conversations[deck]) {
+    if (progress.conversations[deck]) {
       console.log(`RESUME ${deck} at slide ${sent + 1}/${slides.length}`);
-      await page.goto(progress.conversations[deck], { waitUntil: 'domcontentloaded', timeout: 45000 });
+      await gotoGemini(page, progress.conversations[deck], `resume_${deck}`);
       await waitForInput(page);
       await updateConversationFolderIndex(progress, deck, slides, progress.conversations[deck]);
     } else {
@@ -1498,39 +1804,67 @@ try {
       console.log(`FOLDER_INDEX ${deck} -> ${conversationFoldersPath}`);
     }
 
-    for (let index = sent; index < slides.length; index += 1) {
+    if (sent <= 0) {
+      await ensurePrePromptSent(page, deck, progress);
+      if (prePromptText) await ensureConversationRenamed(page, deck, progress, 'after_pre_prompt');
+    } else {
+      await ensureConversationRenamed(page, deck, progress, 'resume_started_deck');
+    }
+
+    for (let index = sent; index < slides.length;) {
       if (maxSlides > 0 && processed >= maxSlides) {
         console.log(`MAX_SLIDES reached (${processed}).`);
         await writeProgress(progress);
         await browser.close();
         process.exit(0);
       }
+      const batchSize = Math.min(
+        pagesPerPrompt,
+        slides.length - index,
+        maxSlides > 0 ? maxSlides - processed : pagesPerPrompt,
+      );
+      if (batchSize <= 0) {
+        console.log(`MAX_SLIDES reached (${processed}).`);
+        await writeProgress(progress);
+        await browser.close();
+        process.exit(0);
+      }
       const slideNumber = index + 1;
-      if (progress.last?.deck === deck && progress.last.slide === slideNumber && progress.last.done === false) {
-        const answerAudit = await inspectLatestAnswer(page, buildPrompt(deck, slideNumber, slides.length));
-        if (answerAudit.hasAnswer && answerAudit.hasUserImage && !answerAudit.missingImage) {
-          progress.last = { deck, slide: slideNumber, totalSlides: slides.length, done: true, url: page.url() };
-          progress.sent[deck] = slideNumber;
-          await alignLatestUserTurnAtTop(page, deck, slideNumber);
-          await writeProgress(progress);
-          console.log(`RECOVER answered ${deck} slide ${slideNumber}/${slides.length}`);
-          continue;
-        }
-        if (answerAudit.hasAnswer && (!answerAudit.hasUserImage || answerAudit.missingImage)) {
-          console.log(`RECOVER_REJECTED_MISSING_IMAGE ${deck} slide ${slideNumber}/${slides.length} userImages=${answerAudit.userImageCount || 0}`);
+      const endSlideNumber = index + batchSize;
+      const slideBatch = slides.slice(index, endSlideNumber);
+      const rangeLabel = slideNumber === endSlideNumber ? `${slideNumber}` : `${slideNumber}-${endSlideNumber}`;
+      if (progress.last?.deck === deck && progress.last.done === false) {
+        const lastStart = Number(progress.last.slideStart || progress.last.slide || 0);
+        const lastEnd = Number(progress.last.slideEnd || progress.last.slide || lastStart);
+        if (lastStart === slideNumber && lastEnd === endSlideNumber) {
+          const answerAudit = await inspectLatestAnswer(page, buildPrompt(deck, slideNumber, slides.length, endSlideNumber));
+          if (answerAudit.hasAnswer && answerAudit.hasUserImage && !answerAudit.missingImage && Number(answerAudit.userImageCount || 0) >= slideBatch.length) {
+            progress.last = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, done: true, url: page.url() };
+            progress.sent[deck] = endSlideNumber;
+            await alignLatestUserTurnAtTop(page, deck, slideNumber);
+            await writeProgress(progress);
+            console.log(`RECOVER answered ${deck} slides ${rangeLabel}/${slides.length}`);
+            index = endSlideNumber;
+            continue;
+          }
+          if (answerAudit.hasAnswer && (!answerAudit.hasUserImage || answerAudit.missingImage || Number(answerAudit.userImageCount || 0) < slideBatch.length)) {
+            console.log(`RECOVER_REJECTED_MISSING_IMAGE ${deck} slides ${rangeLabel}/${slides.length} userImages=${answerAudit.userImageCount || 0}`);
+          }
         }
       }
-      console.log(`SEND ${deck} slide ${slideNumber}/${slides.length}`);
-      progress.last = { deck, slide: slideNumber, totalSlides: slides.length, done: false, url: page.url() };
+      console.log(`SEND ${deck} slides ${rangeLabel}/${slides.length}`);
+      progress.last = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, pagesPerPrompt, done: false, url: page.url() };
       await writeProgress(progress);
-      const result = await sendSlide(page, deck, slides[index], slideNumber, slides.length);
+      const result = await sendSlideBatch(page, deck, slideBatch, slideNumber, endSlideNumber, slides.length);
       if (result.retry) {
-        const retryKey = `${deck}:${slideNumber}`;
+        const retryKey = `${deck}:${slideNumber}-${endSlideNumber}`;
         const retryCount = (retryCounts.get(retryKey) || 0) + 1;
         retryCounts.set(retryKey, retryCount);
         progress.lastRetry = {
           deck,
-          slide: slideNumber,
+          slide: endSlideNumber,
+          slideStart: slideNumber,
+          slideEnd: endSlideNumber,
           totalSlides: slides.length,
           reason: result.reason || 'unknown',
           retryCount,
@@ -1538,53 +1872,49 @@ try {
           updatedAt: new Date().toISOString(),
         };
         await writeProgress(progress);
-        console.log(`RETRY ${deck} slide ${slideNumber}/${slides.length} attempt=${retryCount}/${maxSendAttempts} reason=${result.reason || 'unknown'}`);
+        console.log(`RETRY ${deck} slides ${rangeLabel}/${slides.length} attempt=${retryCount}/${maxSendAttempts} reason=${result.reason || 'unknown'}`);
         if (retryCount > maxSendAttempts) {
-          throw new Error(`Self-check failed too many times on ${deck} slide ${slideNumber}: ${result.reason || 'unknown'}`);
+          throw new Error(`Self-check failed too many times on ${deck} slides ${rangeLabel}: ${result.reason || 'unknown'}`);
         }
         await clearComposer(page).catch((error) => {
-          console.log(`RETRY_CLEAR_FAILED ${deck} slide ${slideNumber}/${slides.length} message="${error instanceof Error ? error.message : String(error)}"`);
+          console.log(`RETRY_CLEAR_FAILED ${deck} slides ${rangeLabel}/${slides.length} message="${error instanceof Error ? error.message : String(error)}"`);
         });
         if (shouldReloadBeforeRetry(result.reason)) {
-          console.log(`RETRY_RELOAD ${deck} slide ${slideNumber}/${slides.length} reason=${result.reason || 'unknown'}`);
+          console.log(`RETRY_RELOAD ${deck} slides ${rangeLabel}/${slides.length} reason=${result.reason || 'unknown'}`);
           await reloadCurrentConversation(page);
         }
-        index -= 1;
         continue;
       }
       if (result.quotaWait) {
         progress.quotaWaiting = true;
         progress.quotaReason = 'during_answer';
         progress.quotaMode = result.mode;
-        progress.lastQuotaSlide = { deck, slide: slideNumber, totalSlides: slides.length, url: page.url(), stopped: result.stopped };
+        progress.lastQuotaSlide = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, url: page.url(), stopped: result.stopped };
         await writeProgress(progress);
-        console.log(`QUOTA_PAUSE ${deck} slide ${slideNumber}/${slides.length} mode="${result.mode?.text || 'unknown'}" stopped=${result.stopped}`);
+        console.log(`QUOTA_PAUSE ${deck} slides ${rangeLabel}/${slides.length} mode="${result.mode?.text || 'unknown'}" stopped=${result.stopped}`);
         await ensureConfiguredModel(page, progress, 'resume_after_fast_mode');
-        index -= 1;
         continue;
       }
       const done = result.done;
       const currentUrl = page.url();
       progress.conversations[deck] = currentUrl;
-      progress.last = { deck, slide: slideNumber, totalSlides: slides.length, done, url: currentUrl };
+      progress.last = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, pagesPerPrompt, done, url: currentUrl };
       if (done) {
-        progress.sent[deck] = slideNumber;
-        if (slideNumber === 1 && progress.renamedTitles[deck] !== deckTitle(deck)) {
-          const title = deckTitle(deck);
-          const renamed = await renameCurrentConversation(page, title);
-          progress.renamedTitles[deck] = title;
-          console.log(`RENAME ${deck} title="${title}" changed=${renamed}`);
+        progress.sent[deck] = endSlideNumber;
+        if (slideNumber === 1 || !isConversationRenameVerified(progress, deck)) {
+          await ensureConversationRenamed(page, deck, progress, `after_slide_${slideNumber}`);
         }
         await alignLatestUserTurnAtTop(page, deck, slideNumber);
       }
       await writeProgress(progress);
       await updateConversationFolderIndex(progress, deck, slides, currentUrl);
-      processed += 1;
-      retryCounts.delete(`${deck}:${slideNumber}`);
-      console.log(`DONE ${deck} slide ${slideNumber}/${slides.length} answerDone=${done}`);
+      processed += slideBatch.length;
+      retryCounts.delete(`${deck}:${slideNumber}-${endSlideNumber}`);
+      console.log(`DONE ${deck} slides ${rangeLabel}/${slides.length} answerDone=${done}`);
       if (!done) {
-        throw new Error(`Timed out waiting for Gemini answer on ${deck} slide ${slideNumber}.`);
+        throw new Error(`Timed out waiting for Gemini answer on ${deck} slides ${rangeLabel}.`);
       }
+      index = endSlideNumber;
     }
   }
   console.log('ALL_DONE');

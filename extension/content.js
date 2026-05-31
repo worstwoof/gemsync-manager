@@ -1214,10 +1214,10 @@
     return promptTexts.some((promptText) => promptText && text.includes(promptText));
   };
 
-  const addPptPromptRoot = (roots, seen, element, promptTexts) => {
+  const addPptPromptRoot = (roots, seen, element, promptTexts, options = {}) => {
     if (!element || host.contains(element)) return;
     const text = normalizeText(element.textContent || "");
-    if (!includesAnyPptPrompt(text, promptTexts)) return;
+    if (!options.includeAllUserTurns && !includesAnyPptPrompt(text, promptTexts)) return;
     if (text.length > 2600 && element.tagName.toLowerCase() !== "user-query") return;
 
     const root = expandPromptRootForReading(messageRootFor(element));
@@ -1262,7 +1262,7 @@
     const roots = [];
     const seen = new Set();
     for (const element of document.querySelectorAll(selector)) {
-      addPptPromptRoot(roots, seen, element, promptTexts);
+      addPptPromptRoot(roots, seen, element, promptTexts, { includeAllUserTurns: true });
     }
     if (!roots.length) collectPromptRootsFromTextNodes(roots, seen, promptTexts);
 
@@ -1274,7 +1274,7 @@
         text: normalizeText(root.innerText || root.textContent || ""),
         hasImage: hasAttachedImage(root),
       }))
-      .filter((item) => includesAnyPptPrompt(item.text, promptTexts))
+      .filter((item) => item.text || item.hasImage)
       .sort((a, b) => a.top - b.top);
 
     const deduped = [];
@@ -1314,7 +1314,7 @@
   };
 
   const sendGeminiVisiblePageToPdf = (position) => {
-    if (!pdfDock || !position) return;
+    if (!pdfDock || !position || !gemSyncPdfState.autoSyncEnabled) return;
     const iframe = pdfDock.querySelector("iframe");
     if (!iframe?.contentWindow) return;
 
@@ -1336,6 +1336,7 @@
     if (!pdfDock || !gemSyncPdfState.autoSyncEnabled) return;
     clearTimeout(gemSyncReverseTimer);
     gemSyncReverseTimer = setTimeout(() => {
+      if (!pdfDock || !gemSyncPdfState.autoSyncEnabled) return;
       const position = visiblePptPosition(gemSyncPdfState.pagePrompt);
       if (!position) return;
       const signature = [
@@ -1356,8 +1357,18 @@
     const all = collectPptPromptCandidates(payload?.pagePrompt);
     const image = all.filter((candidate) => candidate.hasImage);
     const targetImagePromptIndex = Number(binding?.targetImagePromptIndex) || 0;
-    const targetPromptIndex = Number(binding?.targetPromptIndex) || 0;
+    const targetPromptIndex = Number(binding?.targetPromptIndex || binding?.promptIndex || payload?.targetPromptIndex) || 0;
     const allowAbsoluteFallback = options.allowAbsoluteFallback ?? true;
+
+    if (!targetPromptIndex && payload?.hasPromptMapping === false) {
+      return {
+        candidate: null,
+        all,
+        image,
+        mode: "unmapped",
+        target: 0,
+      };
+    }
 
     if (targetImagePromptIndex > 0 && image.length >= targetImagePromptIndex) {
       return {
@@ -1379,23 +1390,13 @@
       };
     }
 
-    if (allowAbsoluteFallback && image.length >= pageNumber) {
+    if (allowAbsoluteFallback && targetPromptIndex > 0 && all.length >= targetPromptIndex) {
       return {
-        candidate: image[pageNumber - 1],
-        all,
-        image,
-        mode: "image",
-        target: pageNumber,
-      };
-    }
-
-    if (allowAbsoluteFallback && all.length >= pageNumber) {
-      return {
-        candidate: all[pageNumber - 1],
+        candidate: all[targetPromptIndex - 1],
         all,
         image,
         mode: "all",
-        target: pageNumber,
+        target: targetPromptIndex,
       };
     }
 
@@ -1961,7 +1962,12 @@
         ...(message.payload || {}),
         autoSyncEnabled: !!message.payload?.autoSyncEnabled,
       };
-      if (gemSyncPdfState.autoSyncEnabled) scheduleGeminiToPdfSync();
+      if (gemSyncPdfState.autoSyncEnabled) {
+        scheduleGeminiToPdfSync();
+      } else {
+        clearTimeout(gemSyncReverseTimer);
+        gemSyncLastReverseSignature = "";
+      }
       return;
     }
     if (!message.id) return;

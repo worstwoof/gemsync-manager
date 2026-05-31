@@ -9,6 +9,8 @@
     "check": "node --check server.mjs"
   },
   "dependencies": {
+    "katex": "^0.17.0",
+    "marked": "^18.0.4",
     "playwright": "^1.60.0"
   }
 }

@@ -6,7 +6,9 @@ const elements = {
   subjectTitle: $("subjectTitle"),
   modelSelect: $("modelSelect"),
   proFallback: $("proFallback"),
+  pagesPerPrompt: $("pagesPerPrompt"),
   promptText: $("promptText"),
+  prePromptText: $("prePromptText"),
   status: $("status"),
   summaryCards: $("summaryCards"),
   details: $("details"),
@@ -24,6 +26,9 @@ const elements = {
   runGemini: $("runGemini"),
   resetProgress: $("resetProgress"),
   updatePlugin: $("updatePlugin"),
+  cacheGemini: $("cacheGemini"),
+  cacheDeckList: $("cacheDeckList"),
+  openCache: $("openCache"),
 };
 
 const state = {
@@ -53,6 +58,11 @@ function saveHiddenJobs() {
   localStorage.setItem("gemsync-manager-hidden-jobs", JSON.stringify([...state.hiddenJobIds]));
 }
 
+function normalizePagesPerPrompt(value, fallback = 1) {
+  const number = Math.floor(Number(value) || Number(fallback) || 1);
+  return Math.max(1, Math.min(3, number));
+}
+
 function isJobVisible(job) {
   return job.status === "running" || !state.hiddenJobIds.has(job.id);
 }
@@ -80,7 +90,9 @@ function saveForm() {
     subjectTitle: elements.subjectTitle.value,
     model: elements.modelSelect.value,
     proFallback: elements.proFallback.value,
+    pagesPerPrompt: normalizePagesPerPrompt(elements.pagesPerPrompt?.value),
     prompt: elements.promptText.value,
+    prePrompt: elements.prePromptText.value,
   }));
 }
 
@@ -91,7 +103,11 @@ function loadForm(defaults) {
   elements.subjectTitle.value = saved.subjectTitle || defaults.subjectTitle || "";
   elements.modelSelect.value = saved.model || defaults.model || "pro";
   elements.proFallback.value = saved.proFallback || defaults.proFallback || "flash";
+  if (elements.pagesPerPrompt) {
+    elements.pagesPerPrompt.value = String(normalizePagesPerPrompt(saved.pagesPerPrompt || defaults.pagesPerPrompt || 1));
+  }
   elements.promptText.value = saved.prompt || defaults.prompt || "请详细讲解这一面PPT";
+  elements.prePromptText.value = saved.prePrompt || defaults.prePrompt || "";
   state.lastAutoSubjectTitle = folderNameFromPath(elements.workspace.value);
   state.lastAutoSubjectId = subjectIdFromTitle(state.lastAutoSubjectTitle);
 }
@@ -156,7 +172,9 @@ function payload() {
     title: elements.subjectTitle.value.trim(),
     model: elements.modelSelect.value,
     proFallback: elements.proFallback.value,
+    pagesPerPrompt: normalizePagesPerPrompt(elements.pagesPerPrompt?.value),
     prompt: elements.promptText.value.trim() || "请详细讲解这一面PPT",
+    prePrompt: elements.prePromptText.value.trim(),
   };
 }
 
@@ -189,18 +207,98 @@ function card(label, value, meta = "", tone = "", extraClass = "") {
   </div>`;
 }
 
+function cacheDeckCandidates(summary = state.summary) {
+  const cacheDecks = summary?.cache?.decks || [];
+  const cacheByDeck = new Map(cacheDecks.map((deck) => [deck.id, deck]));
+  if (summary?.decks?.length) {
+    return summary.decks.map((deck, index) => {
+      const id = deck.id || (deck.deckNumber ? `deck${String(deck.deckNumber).padStart(2, "0")}` : `deck${String(index + 1).padStart(2, "0")}`);
+      const cached = cacheByDeck.get(id) || deck.cache || {};
+      return {
+        ...cached,
+        id,
+        title: cached.title || deck.title || deck.folder || id,
+        totalPages: cached.totalPages || deck.slides || 0,
+        geminiUrl: cached.geminiUrl || deck.geminiUrl || deck.conversationUrl || "",
+        conversationId: cached.conversationId || deck.conversationId || "",
+        cacheExists: !!cached.cacheExists,
+        cacheUrl: cached.cacheUrl || "",
+      };
+    });
+  }
+  return cacheDecks;
+}
+
+function selectedCacheDecks() {
+  return Array.from(elements.cacheDeckList?.querySelectorAll("input[name='cacheDeck']:checked") || [])
+    .map((input) => input.value)
+    .filter(Boolean);
+}
+
+function selectedCacheableDecks(summary = state.summary) {
+  const byId = new Map(cacheDeckCandidates(summary).map((deck) => [deck.id, deck]));
+  return selectedCacheDecks()
+    .filter((id) => {
+      const deck = byId.get(id);
+      return deck?.geminiUrl && !deck.cacheExists;
+    });
+}
+
+function uncachedCacheableDecks(summary = state.summary) {
+  return cacheDeckCandidates(summary).filter((deck) => deck.id && deck.geminiUrl && !deck.cacheExists);
+}
+
+function cachedDecks(summary = state.summary) {
+  return cacheDeckCandidates(summary).filter((deck) => deck.cacheExists && deck.cacheUrl);
+}
+
+function renderCacheDeckOptions(summary) {
+  if (!elements.cacheDeckList) return;
+  const previous = new Set(selectedCacheDecks());
+  const candidates = cacheDeckCandidates(summary).filter((deck) => deck.id);
+  if (!candidates.length) {
+    elements.cacheDeckList.innerHTML = '<p class="cache-deck-empty">扫描后会在这里选择要缓存的 Gemini 对话。</p>';
+    return;
+  }
+
+  elements.cacheDeckList.innerHTML = candidates.map((deck) => {
+    const canCache = !!deck.geminiUrl && !deck.cacheExists;
+    const checked = canCache && (previous.size ? previous.has(deck.id) : true);
+    const status = deck.cacheExists ? "已缓存" : (canCache ? "待缓存" : "无对话");
+    const meta = [
+      deck.totalPages ? `${deck.totalPages} 页` : "",
+      deck.conversationId ? `对话 ${deck.conversationId}` : "",
+    ].filter(Boolean).join(" · ") || "还没有 Gemini 对话链接";
+    return `<label class="cache-deck-option${deck.cacheExists ? " is-cached" : ""}${canCache ? "" : " is-disabled"}">
+      <input type="checkbox" name="cacheDeck" value="${escapeHtml(deck.id)}"${checked ? " checked" : ""}${canCache ? "" : " disabled"} />
+      <span><strong>${escapeHtml(deck.title || deck.id)}</strong><small>${escapeHtml(meta)}</small></span>
+      <em>${escapeHtml(status)}</em>
+    </label>`;
+  }).join("");
+}
+
 function renderSummary(summary) {
   state.summary = summary;
   const conversationCount = summary.progress.conversationCount || summary.conversationFoldersCount;
   const totalSlides = summary.progress.totalSlides || 0;
   const sentSlides = summary.progress.sentSlides || 0;
+  const cacheDecks = summary.cache?.transcriptDeckCount || 0;
+  const cacheTotal = Math.max(summary.cache?.totalDecks || 0, summary.decks.length || 0);
+  const cacheMeta = cacheDecks
+    ? `${summary.cache?.recordCount || 0} 条记录 · ${summary.cache?.interactiveViewCount || 0} 个动态组件`
+    : "还没生成缓存";
   const progressChanged = state.lastSentSlides !== null && sentSlides !== state.lastSentSlides;
+  const unscreenedPpts = summary.unscreenedPpts || [];
+  const pptMeta = unscreenedPpts.length
+    ? `${unscreenedPpts.length} 个待截图`
+    : (summary.ppts.length ? "可生成截图" : "可只用 PDF");
   elements.summaryCards.innerHTML = [
     card("PDF 文件", summary.pdfs.length, summary.pdfs.length ? "可以写入插件" : "还没扫到 PDF", summary.pdfs.length ? "tone-sky" : "tone-muted"),
-    card("PPT 文件", summary.ppts.length, summary.ppts.length ? "可生成截图" : "可只用 PDF", summary.ppts.length ? "tone-amber" : "tone-muted"),
+    card("PPT 文件", summary.ppts.length, pptMeta, unscreenedPpts.length ? "tone-warn" : (summary.ppts.length ? "tone-amber" : "tone-muted")),
     card("截图 Deck", summary.decks.length, summary.decks.length ? `${totalSlides} 页截图` : "需要准备截图", summary.decks.length ? "tone-mint" : "tone-warn"),
     card("Gemini 对话", conversationCount, conversationCount ? "已记录链接" : "还没记录对话", conversationCount ? "tone-sky" : "tone-muted"),
     card("已问页数", totalSlides ? `${sentSlides}/${totalSlides}` : "0", totalSlides ? "按进度文件统计" : "暂无进度", totalSlides && sentSlides >= totalSlides ? "tone-mint" : "tone-muted", progressChanged ? "progress-bump" : ""),
+    card("离线缓存", cacheTotal ? `${cacheDecks}/${cacheTotal}` : "0", cacheMeta, cacheDecks && cacheDecks >= cacheTotal ? "tone-mint" : "tone-muted"),
   ].join("");
   state.lastSentSlides = sentSlides;
 
@@ -211,6 +309,13 @@ function renderSummary(summary) {
     </div>`;
   }).join("");
 
+  const unscreenedRows = unscreenedPpts.slice(0, 8).map((file) => {
+    return `<div class="detail-row pending-row">
+      <div><strong>${escapeHtml(file.name)}</strong><br><small>${escapeHtml(file.path)}</small></div>
+      <span class="badge pending-badge">待截图</span>
+    </div>`;
+  }).join("");
+
   const fileRows = summary.pdfs.slice(0, 8).map((file) => {
     return `<div class="detail-row">
       <div><strong>${escapeHtml(file.name)}</strong><br><small>${escapeHtml(file.path)}</small></div>
@@ -218,7 +323,10 @@ function renderSummary(summary) {
     </div>`;
   }).join("");
 
-  elements.details.innerHTML = deckRows || fileRows || "<p>还没有扫描到 PDF 或截图 deck。</p>";
+  elements.details.innerHTML = deckRows || unscreenedRows
+    ? `${deckRows}${unscreenedRows}`
+    : (fileRows || "<p>还没有扫描到 PDF、PPT 或截图 deck。</p>");
+  renderCacheDeckOptions(summary);
   updateWorkflowState();
 }
 
@@ -251,6 +359,7 @@ function clearSummary() {
   state.lastSentSlides = null;
   elements.summaryCards.innerHTML = "";
   elements.details.innerHTML = "<p>请先扫描当前学科文件夹。</p>";
+  renderCacheDeckOptions(null);
   updateWorkflowState();
 }
 
@@ -297,14 +406,33 @@ function updateWorkflowState() {
   const pdfCount = summary?.pdfs?.length || 0;
   const pptCount = summary?.ppts?.length || 0;
   const deckCount = summary?.decks?.length || 0;
+  const pendingPptCount = summary?.unscreenedPpts?.length || 0;
   const conversationCount = summary?.progress?.conversationCount || summary?.conversationFoldersCount || 0;
   const completedDeckCount = summary?.progress?.completedDeckCount || 0;
-  const allDecksComplete = deckCount > 0 && completedDeckCount >= deckCount;
-  const hasAllConversations = deckCount > 0 && conversationCount >= deckCount;
+  const allDecksComplete = deckCount > 0 && pendingPptCount === 0 && completedDeckCount >= deckCount;
+  const hasAllConversations = deckCount > 0 && pendingPptCount === 0 && conversationCount >= deckCount;
+  const configuredDeckCount = summary?.cache?.totalDecks || 0;
+  const pluginWritten = !!summary?.cache?.configExists && configuredDeckCount >= deckCount;
+  const cacheDecks = summary?.cache?.transcriptDeckCount || 0;
+  const cacheTotal = Math.max(configuredDeckCount, deckCount);
+  const cacheComplete = pluginWritten && cacheTotal > 0 && cacheDecks >= cacheTotal && (allDecksComplete || hasAllConversations);
+  const uncachedDecks = uncachedCacheableDecks(summary);
+  const selectedUncachedDecks = selectedCacheableDecks(summary);
   const hasFiles = pdfCount > 0 || pptCount > 0 || deckCount > 0;
   const hasScreenshots = deckCount > 0;
   const hasPpts = pptCount > 0;
   const chromeOk = !!state.chromeOk;
+  const canGenerateCache = scanned
+    && pendingPptCount === 0
+    && hasScreenshots
+    && chromeOk
+    && (allDecksComplete || hasAllConversations)
+    && !running
+    && selectedUncachedDecks.length > 0;
+  const canPrepareScreenshots = scanned && !running && (
+    pendingPptCount > 0
+    || (!hasScreenshots && (hasPpts || pdfCount > 0))
+  );
 
   let next = "scan";
   let hint = "先选择或确认学科文件夹，然后扫描。";
@@ -320,6 +448,9 @@ function updateWorkflowState() {
   } else if (!hasFiles) {
     next = "scan";
     hint = "这个文件夹里没有扫描到 PDF、PPT 或截图。请确认选的是课程文件夹。";
+  } else if (pendingPptCount > 0) {
+    next = "prepare";
+    hint = `发现 ${pendingPptCount} 个 PPT 还没有生成截图。下一步点“准备截图”，会只追加这些新课件。`;
   } else if (!hasScreenshots && (hasPpts || pdfCount > 0)) {
     next = "prepare";
     hint = hasPpts
@@ -328,9 +459,15 @@ function updateWorkflowState() {
   } else if (hasScreenshots && !chromeOk) {
     next = "chrome";
     hint = "已经有截图。下一步打开 Gemini 标签页，并确认 Gemini 已登录。";
-  } else if (hasScreenshots && chromeOk && (allDecksComplete || hasAllConversations)) {
+  } else if (hasScreenshots && chromeOk && (allDecksComplete || hasAllConversations) && !pluginWritten) {
     next = "plugin";
     hint = allDecksComplete ? "这些截图看起来已经全部问完。下一步写入插件。" : "Gemini 对话数量已经对上。下一步写入插件。";
+  } else if (hasScreenshots && chromeOk && (allDecksComplete || hasAllConversations) && !cacheComplete) {
+    next = "cache";
+    hint = "插件配置已经有了。下一步生成 Gemini 全记录离线缓存。";
+  } else if (hasScreenshots && chromeOk && cacheComplete) {
+    next = "";
+    hint = "这门课的插件配置和 Gemini 离线缓存都已经准备好。";
   } else if (hasScreenshots && chromeOk && conversationCount < deckCount) {
     next = "gemini";
     hint = "截图已准备好，Chrome 也已打开。下一步可以启动 Gemini 自动问。";
@@ -346,22 +483,32 @@ function updateWorkflowState() {
     reason: workspace ? "当前有任务正在运行" : "请先选择学科文件夹",
   });
   setStep(elements.prepare, {
-    enabled: scanned && !hasScreenshots && (hasPpts || pdfCount > 0) && !running,
+    enabled: canPrepareScreenshots,
     primary: next === "prepare",
-    complete: hasScreenshots,
-    reason: !scanned ? "请先扫描文件夹" : hasScreenshots ? "已经有截图" : (hasPpts || pdfCount > 0) ? "当前有任务正在运行" : "没有 PDF 或 PPT，无法生成截图",
+    complete: hasScreenshots && pendingPptCount === 0,
+    reason: !scanned
+      ? "请先扫描文件夹"
+      : running
+        ? "当前有任务正在运行"
+        : pendingPptCount > 0
+          ? ""
+          : hasScreenshots
+            ? "已有截图，且没有发现待追加的 PPT"
+            : (hasPpts || pdfCount > 0)
+              ? "可以生成截图"
+              : "没有 PDF 或 PPT，无法生成截图",
   });
   setStep(elements.chrome, {
-    enabled: scanned && hasScreenshots && !running,
+    enabled: scanned && hasScreenshots && pendingPptCount === 0 && !running,
     primary: next === "chrome",
     complete: chromeOk,
-    reason: !scanned ? "请先扫描文件夹" : !hasScreenshots ? "没有截图，暂时不需要打开 Gemini 标签页" : "当前有任务正在运行",
+    reason: !scanned ? "请先扫描文件夹" : pendingPptCount > 0 ? "请先给新增 PPT 准备截图" : !hasScreenshots ? "没有截图，暂时不需要打开 Gemini 标签页" : "当前有任务正在运行",
   });
   setStep(elements.runGemini, {
-    enabled: scanned && hasScreenshots && chromeOk && !allDecksComplete && !running,
+    enabled: scanned && hasScreenshots && pendingPptCount === 0 && chromeOk && !allDecksComplete && !running,
     primary: next === "gemini",
     complete: allDecksComplete || hasAllConversations,
-    reason: !scanned ? "请先扫描文件夹" : !hasScreenshots ? "没有截图，不能启动 Gemini 自动问" : !chromeOk ? "请先打开自动化 Chrome" : allDecksComplete ? "截图已经全部问完" : "当前有任务正在运行",
+    reason: !scanned ? "请先扫描文件夹" : pendingPptCount > 0 ? "请先给新增 PPT 准备截图" : !hasScreenshots ? "没有截图，不能启动 Gemini 自动问" : !chromeOk ? "请先打开自动化 Chrome" : allDecksComplete ? "截图已经全部问完" : "当前有任务正在运行",
   });
   elements.resetProgress.disabled = !(scanned && hasScreenshots && !running);
   elements.resetProgress.title = !scanned
@@ -372,11 +519,36 @@ function updateWorkflowState() {
         ? "当前有任务正在运行"
         : "备份旧进度，并从第 1 页重新开始 Gemini 提问";
   setStep(elements.updatePlugin, {
-    enabled: scanned && pdfCount > 0 && hasScreenshots && (allDecksComplete || hasAllConversations) && !running,
+    enabled: scanned && pendingPptCount === 0 && pdfCount > 0 && hasScreenshots && (allDecksComplete || hasAllConversations) && !running,
     primary: next === "plugin",
-    complete: false,
-    reason: !scanned ? "请先扫描文件夹" : !hasScreenshots ? "请先准备截图，最后再写入插件" : !(allDecksComplete || hasAllConversations) ? "请先启动 Gemini 自动问，最后再写入插件" : pdfCount > 0 ? "当前有任务正在运行" : "没有 PDF，无法写入插件",
+    complete: pluginWritten,
+    reason: !scanned ? "请先扫描文件夹" : pendingPptCount > 0 ? "请先给新增 PPT 准备截图" : !hasScreenshots ? "请先准备截图，最后再写入插件" : !(allDecksComplete || hasAllConversations) ? "请先启动 Gemini 自动问，最后再写入插件" : pdfCount > 0 ? "当前有任务正在运行" : "没有 PDF，无法写入插件",
   });
+  setStep(elements.cacheGemini, {
+    enabled: canGenerateCache,
+    primary: next === "cache",
+    complete: cacheComplete,
+    reason: !scanned
+      ? "请先扫描文件夹"
+      : pendingPptCount > 0
+        ? "请先给新增 PPT 准备截图"
+        : !hasScreenshots
+          ? "请先准备截图"
+          : !chromeOk
+            ? "请先打开自动化 Chrome"
+            : !(allDecksComplete || hasAllConversations)
+              ? "请先完成 Gemini 自动问"
+              : running
+                ? "当前有任务正在运行"
+                : !uncachedDecks.length
+                  ? "已全部缓存，可直接打开缓存"
+                  : "请勾选至少一个未缓存的对话",
+  });
+  if (elements.openCache) {
+    const hasCache = cachedDecks(summary).length > 0;
+    elements.openCache.disabled = !hasCache;
+    elements.openCache.title = hasCache ? "" : "还没有可打开的离线缓存";
+  }
   setWorkflowHint(hint);
 }
 
@@ -460,11 +632,11 @@ async function refreshJobsAndLog() {
   pruneHiddenJobs(data.jobs);
   renderJobs(data.jobs);
   const hasRunningContentJob = data.jobs.some((job) => (
-    (job.type === "prepare" || job.type === "gemini")
+    (job.type === "prepare" || job.type === "gemini" || job.type === "plugin" || job.type === "cache")
     && job.status === "running"
   ));
   const justCompletedContentJob = data.jobs.find((job) => (
-    (job.type === "prepare" || job.type === "gemini")
+    (job.type === "prepare" || job.type === "gemini" || job.type === "plugin" || job.type === "cache")
     && job.status === "complete"
     && !state.refreshedJobIds.has(job.id)
   ));
@@ -617,6 +789,29 @@ async function writePluginConfig() {
   }
 }
 
+async function cacheGeminiTranscript() {
+  const cacheDecks = selectedCacheableDecks();
+  if (!cacheDecks.length) {
+    setStatus("没有未缓存的已选 Gemini 对话需要生成");
+    return;
+  }
+  const job = await startJob("/api/jobs/cache", { ...payload(), cacheDecks });
+  const result = job.result || {};
+  setStatus(`已开始生成离线缓存：${result.title || "当前学科"} · ${cacheDecks.length} 个对话`);
+}
+
+function openCachedContent() {
+  const selected = new Set(selectedCacheDecks());
+  const decks = cachedDecks();
+  const deck = decks.find((item) => selected.has(item.id)) || decks[0];
+  if (!deck?.cacheUrl) {
+    setStatus("还没有可打开的离线缓存");
+    return;
+  }
+  window.open(deck.cacheUrl, "_blank", "noopener");
+  setStatus(`已打开离线缓存：${deck.title || deck.id}`);
+}
+
 elements.workspace.addEventListener("change", () => {
   autoFillSubjectFromWorkspace();
   clearSummary();
@@ -628,11 +823,15 @@ for (const input of [
   elements.subjectTitle,
   elements.modelSelect,
   elements.proFallback,
+  elements.pagesPerPrompt,
   elements.promptText,
+  elements.prePromptText,
 ]) {
-  input.addEventListener("change", saveForm);
+  input?.addEventListener("change", saveForm);
 }
 elements.promptText.addEventListener("input", saveForm);
+elements.prePromptText.addEventListener("input", saveForm);
+elements.cacheDeckList?.addEventListener("change", updateWorkflowState);
 
 elements.refreshState.addEventListener("click", () => refreshState().catch((error) => setStatus(error.message)));
 elements.pickWorkspace.addEventListener("click", () => chooseFolder(elements.workspace, "选择学科文件夹", { scanAfterPick: true }).catch((error) => setStatus(error.message)));
@@ -642,6 +841,8 @@ elements.chrome.addEventListener("click", () => startChrome().catch((error) => s
 elements.runGemini.addEventListener("click", () => startJob("/api/jobs/gemini").catch((error) => setStatus(error.message)));
 elements.resetProgress.addEventListener("click", () => resetProgress().catch((error) => setStatus(error.message)));
 elements.updatePlugin.addEventListener("click", () => writePluginConfig().catch((error) => setStatus(error.message)));
+elements.cacheGemini.addEventListener("click", () => cacheGeminiTranscript().catch((error) => setStatus(error.message)));
+elements.openCache.addEventListener("click", () => openCachedContent());
 elements.stopJob.addEventListener("click", () => stopSelectedJob().catch((error) => setStatus(error.message)));
 elements.clearLog.addEventListener("click", () => clearSelectedLog().catch((error) => setStatus(error.message)));
 elements.clearFinishedJobs.addEventListener("click", () => clearFinishedJobs().catch((error) => setStatus(error.message)));
@@ -651,4 +852,5 @@ state.pollTimer = setInterval(() => {
 }, 1800);
 
 refreshState().catch((error) => setStatus(error.message));
+renderCacheDeckOptions(null);
 updateWorkflowState();
