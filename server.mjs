@@ -16,11 +16,7 @@ const NODE = process.env.GEMSYNC_NODE || process.execPath || "node";
 const PYTHON = process.env.GEMSYNC_PYTHON || "python";
 const PDFINFO = process.env.GEMSYNC_PDFINFO || "pdfinfo";
 const PDFTOPPM = process.env.GEMSYNC_PDFTOPPM || "pdftoppm";
-const CHROME = process.env.GEMSYNC_CHROME || firstExisting([
-  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-  path.join(process.env.LOCALAPPDATA || "", "Google\\Chrome\\Application\\chrome.exe"),
-]) || "chrome.exe";
+const CHROME = process.env.GEMSYNC_CHROME || firstExisting(chromeExecutableCandidates()) || defaultChromeCommand();
 const AUTOMATION_SCRIPTS_ROOT = process.env.GEMSYNC_AUTOMATION_SCRIPTS || path.join(ROOT, "scripts");
 const LEGACY_SKILL_ROOT = process.env.GEMSYNC_SKILL_ROOT || "";
 const DEFAULT_EXTENSION_ROOT = process.env.GEMSYNC_EXTENSION_ROOT || path.join(ROOT, "extension");
@@ -93,6 +89,34 @@ function loadLocalEnv(root) {
 
 function firstExisting(candidates) {
   return candidates.find((candidate) => candidate && fs.existsSync(candidate)) || "";
+}
+
+function chromeExecutableCandidates() {
+  if (process.platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(process.env.HOME || "", "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+  }
+  if (process.platform === "win32") {
+    return [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      path.join(process.env.LOCALAPPDATA || "", "Google\\Chrome\\Application\\chrome.exe"),
+    ];
+  }
+  return [
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+}
+
+function defaultChromeCommand() {
+  if (process.platform === "win32") return "chrome.exe";
+  if (process.platform === "darwin") return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+  return "google-chrome";
 }
 
 function normalizePort(value, fallback = DEFAULT_MANAGER_PORT) {
@@ -2018,6 +2042,41 @@ async function organizeWorkspaceJob(body) {
 }
 
 async function pickFolder(body) {
+  if (process.platform === "darwin") {
+    const initialPath = path.resolve(body.initialPath || process.env.HOME || ".");
+    const prompt = String(body.title || "选择文件夹").replace(/"/g, '\\"');
+    const script = [
+      `set promptText to "${prompt}"`,
+      `set defaultFolder to POSIX file "${initialPath.replace(/"/g, '\\"')}"`,
+      "try",
+      "  set pickedFolder to choose folder with prompt promptText default location defaultFolder",
+      "  POSIX path of pickedFolder",
+      "on error",
+      '  ""',
+      "end try",
+    ].join("\n");
+
+    return new Promise((resolve, reject) => {
+      const child = spawn("osascript", ["-e", script], { windowsHide: true });
+      let output = "";
+      let errorOutput = "";
+      child.stdout.on("data", (chunk) => { output += chunk.toString("utf8"); });
+      child.stderr.on("data", (chunk) => { errorOutput += chunk.toString("utf8"); });
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code !== 0 && errorOutput.trim()) {
+          reject(new Error(errorOutput.trim()));
+          return;
+        }
+        resolve(output.trim());
+      });
+    });
+  }
+
+  if (process.platform !== "win32") {
+    return "";
+  }
+
   const script = `
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)

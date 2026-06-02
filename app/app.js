@@ -894,17 +894,31 @@ async function resetProgress() {
 
 async function chooseFolder(input, title, options = {}) {
   setStatus("\u6b63\u5728\u9009\u62e9\u6587\u4ef6\u5939...");
-  const data = await api("/api/pick-folder", {
-    method: "POST",
-    body: JSON.stringify({
-      title,
-      initialPath: input.value.trim(),
-    }),
-  });
+  let data = null;
+  try {
+    data = await api("/api/pick-folder", {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        initialPath: input.value.trim(),
+      }),
+    });
+  } catch (error) {
+    const manualPath = window.prompt(title + "\n\n如果系统选择器没有打开，请把课程文件夹路径粘贴到这里：", input.value.trim());
+    if (!manualPath) {
+      setStatus("\u5df2\u53d6\u6d88\u9009\u62e9\u6587\u4ef6\u5939");
+      return;
+    }
+    data = { path: manualPath.trim() };
+  }
 
   if (data.canceled || !data.path) {
-    setStatus("\u5df2\u53d6\u6d88\u9009\u62e9\u6587\u4ef6\u5939");
-    return;
+    const manualPath = window.prompt(title + "\n\n请选择失败时，可以直接粘贴课程文件夹路径：", input.value.trim());
+    if (!manualPath) {
+      setStatus("\u5df2\u53d6\u6d88\u9009\u62e9\u6587\u4ef6\u5939");
+      return;
+    }
+    data = { path: manualPath.trim() };
   }
 
   input.value = data.path;

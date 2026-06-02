@@ -6,8 +6,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
-const ENV_ROOT = "F:\\Environment";
-const FILE_READER_BIN = path.join(ENV_ROOT, "file_reader_env", "Library", "bin");
+const ENV_ROOT = process.platform === "win32" ? "F:\\Environment" : "";
+const FILE_READER_BIN = ENV_ROOT ? path.join(ENV_ROOT, "file_reader_env", "Library", "bin") : "";
 
 const checks = [];
 
@@ -28,8 +28,8 @@ function commandCandidates(name, commonPaths = []) {
   const paths = [
     ...(process.env.PATH || "").split(path.delimiter),
     FILE_READER_BIN,
-    path.join(ENV_ROOT, "nodejs"),
-    path.join(ENV_ROOT, "bin"),
+    ENV_ROOT ? path.join(ENV_ROOT, "nodejs") : "",
+    ENV_ROOT ? path.join(ENV_ROOT, "bin") : "",
   ].filter(Boolean);
   const found = [];
   for (const candidate of commonPaths) {
@@ -52,6 +52,40 @@ function firstCommand(name, envName = "", commonPaths = []) {
     if (fromEnv) return fromEnv;
   }
   return commandCandidates(name, commonPaths)[0] || "";
+}
+
+function chromeCommonPaths() {
+  if (process.platform === "darwin") {
+    return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      path.join(process.env.HOME || "", "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+      "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ];
+  }
+  if (process.platform === "win32") {
+    return [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+    ];
+  }
+  return ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
+}
+
+function officeCommonPaths() {
+  if (process.platform === "darwin") {
+    return [
+      "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+      path.join(process.env.HOME || "", "Applications/LibreOffice.app/Contents/MacOS/soffice"),
+    ];
+  }
+  if (process.platform === "win32") {
+    return [
+      "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+      "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+    ];
+  }
+  return ["/usr/bin/soffice", "/usr/bin/libreoffice"];
 }
 
 function commandVersion(command, args = ["--version"], timeoutMs = 5000) {
@@ -280,15 +314,8 @@ async function main() {
   const pdfinfo = firstCommand("pdfinfo", "GEMSYNC_PDFINFO");
   const pdftoppm = firstCommand("pdftoppm", "GEMSYNC_PDFTOPPM");
   const python = firstCommand("python", "GEMSYNC_PYTHON");
-  const chrome = firstCommand("chrome", "GEMSYNC_CHROME", [
-    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
-    path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
-  ]);
-  const soffice = firstCommand("soffice", "GEMSYNC_SOFFICE", [
-    "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-    "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-  ]);
+  const chrome = firstCommand("chrome", "GEMSYNC_CHROME", chromeCommonPaths());
+  const soffice = firstCommand("soffice", "GEMSYNC_SOFFICE", officeCommonPaths());
   addCheck("pdfinfo", !!pdfinfo, pdfinfo || "not found");
   addCheck("pdftoppm", !!pdftoppm, pdftoppm || "not found");
   addCheck("Python", !!python, python || "not found");

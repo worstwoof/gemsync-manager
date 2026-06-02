@@ -59,7 +59,8 @@ async function pathExists(filePath) {
 async function findPythonWithPillow() {
   const candidates = [
     process.env.GEMSYNC_PYTHON,
-    "F:\\Environment\\file_reader_env\\python.exe",
+    process.platform === "win32" ? "F:\\Environment\\file_reader_env\\python.exe" : "",
+    "python3",
     "python",
   ].filter(Boolean);
 

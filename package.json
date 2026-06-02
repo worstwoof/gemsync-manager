@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "setup": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-env.ps1",
+    "setup:mac": "zsh scripts/setup-mac.sh",
     "start": "node server.mjs",
+    "start:mac": "node server.mjs",
     "check": "node scripts/check_code_syntax.mjs",
     "check:brand": "node scripts/check_brand_assets.mjs",
     "check:ps": "node scripts/check_powershell_syntax.mjs",
