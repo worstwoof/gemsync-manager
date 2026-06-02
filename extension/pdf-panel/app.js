@@ -79,6 +79,8 @@ function notifyParentState() {
       subjectTitle: state.subject?.title || "",
       conversationId: state.deck?.conversationId || "",
       geminiUrl: state.deck?.geminiUrl || "",
+      chatgptUrl: state.deck?.chatgptUrl || "",
+      provider: state.deck?.provider || state.config?.provider || "gemini",
       pageNumber: state.currentPage || 1,
       pagePrompt: state.config?.pagePrompt || "",
       promptStartIndex: configuredPromptStartIndex(),
@@ -181,12 +183,21 @@ function setAutoSyncEnabled(enabled, statusText = "") {
 }
 
 function updateControls() {
+  const provider = state.deck?.provider || state.config?.provider || "gemini";
   elements.deckTitle.textContent = state.deck?.title || "算法导论";
   elements.pageInput.value = state.currentPage;
   elements.pageInput.max = state.pageCount || 1;
   elements.totalPages.textContent = state.pageCount || 0;
   elements.prevPage.disabled = state.currentPage <= 1;
   elements.nextPage.disabled = state.currentPage >= state.pageCount;
+  if (elements.openGemini) {
+    const targetUrl = provider === "chatgpt" ? state.deck?.chatgptUrl : state.deck?.geminiUrl;
+    elements.openGemini.textContent = provider === "chatgpt" ? "打开 ChatGPT" : "打开 Gemini";
+    elements.openGemini.disabled = !targetUrl;
+    elements.openGemini.title = targetUrl
+      ? (provider === "chatgpt" ? "打开 ChatGPT 网页原对话" : "打开 Gemini 原对话")
+      : "这个章节还没有原对话链接";
+  }
 
   for (const button of elements.pageRail.querySelectorAll(".rail-page")) {
     const page = Number(button.dataset.page);
@@ -235,6 +246,32 @@ function postToExtension(kind, payload, timeoutMs = 7000) {
   });
 }
 
+function postToRuntime(kind, payload, timeoutMs = 7000) {
+  const type = bridgeEvents[kind];
+  const runtime = globalThis.chrome?.runtime;
+  if (!type || !runtime?.id || !runtime?.sendMessage) return null;
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("没有收到 Chrome 插件回应，请确认 Gemini Reading Marker 插件已重新加载。"));
+    }, timeoutMs);
+
+    runtime.sendMessage({ type, payload }, (response) => {
+      clearTimeout(timer);
+      const error = runtime.lastError;
+      if (error) {
+        reject(new Error(error.message));
+        return;
+      }
+      if (response?.ok) {
+        resolve(response);
+      } else {
+        reject(new Error(response?.error || "插件执行失败。"));
+      }
+    });
+  });
+}
+
 async function postCommand(kind, payload) {
   const type = bridgeEvents[kind];
   if (!type) throw new Error(`Unknown command kind: ${kind}`);
@@ -268,6 +305,25 @@ async function waitForCommandResult(id, timeoutMs = 12000) {
     await new Promise((resolve) => setTimeout(resolve, 450));
   }
   throw new Error("已发送同步任务，但 Gemini 还没回报执行结果。请刷新 Gemini 页或重新加载扩展。");
+}
+
+async function sendModelCommand(kind, payload, timeoutMs = 12000, parentOptions = {}) {
+  if (state.embedded) {
+    return postToParent(kind, payload, timeoutMs, parentOptions);
+  }
+
+  const runtimeResult = postToRuntime(kind, payload, timeoutMs);
+  if (runtimeResult) return runtimeResult;
+
+  try {
+    return await postToExtension(kind, payload, timeoutMs);
+  } catch (error) {
+    if (!/没有收到 Chrome 插件回应|Extension context expired|context invalidated/i.test(error.message || "")) {
+      throw error;
+    }
+  }
+
+  return waitForCommandResult(await postCommand(kind, payload), timeoutMs);
 }
 
 window.addEventListener("message", (event) => {
@@ -356,6 +412,8 @@ function syncPayload(pageNumber = state.currentPage, reason = "manual", options 
     deckTitle: state.deck.title,
     conversationId: state.deck.conversationId,
     geminiUrl: state.deck.geminiUrl,
+    chatgptUrl: state.deck.chatgptUrl,
+    provider: state.deck.provider || state.config.provider || "gemini",
     pagePrompt: state.config.pagePrompt,
     promptStartIndex: configuredPromptStartIndex(),
     pagesPerPrompt: configuredPagesPerPrompt(),
@@ -557,9 +615,12 @@ async function sendSync(reason = "manual", options = {}) {
       }
       return;
     }
-    const result = state.embedded
-      ? await postToParent("sync", payload, deep ? 310000 : 2000, { resolveOnTimeout: !deep })
-      : await waitForCommandResult(await postCommand("sync", payload), deep ? 310000 : 12000);
+    const result = await sendModelCommand(
+      "sync",
+      payload,
+      deep ? 310000 : (state.embedded ? 2000 : 12000),
+      { resolveOnTimeout: !deep },
+    );
     if (result.pending) {
       if (reason !== "auto") {
         enableGeminiFollowAfterPositioning(pageNumber, "已发送同步");
@@ -638,9 +699,7 @@ async function bindCurrentPage() {
   const pageNumber = state.currentPage;
   setStatus(`校准第 ${pageNumber} 页`, "busy");
   try {
-    const result = state.embedded
-      ? await postToParent("bind", syncPayload(pageNumber, "bind"), 30000)
-      : await waitForCommandResult(await postCommand("bind", syncPayload(pageNumber, "bind")), 15000);
+    const result = await sendModelCommand("bind", syncPayload(pageNumber, "bind"), 15000);
     const binding = {
       ...result.binding,
       deckId: state.deck.id,
@@ -662,18 +721,24 @@ async function openGemini() {
 }
 
 async function switchGeminiForDeck(pageNumber = 1, reason = "deck-change") {
-  if (!state.deck?.geminiUrl) return;
+  const provider = state.deck?.provider || state.config?.provider || "gemini";
+  const providerName = provider === "chatgpt" ? "ChatGPT" : "Gemini";
+  const targetUrl = provider === "chatgpt" ? state.deck?.chatgptUrl : state.deck?.geminiUrl;
+  if (!targetUrl) {
+    setStatus(`${providerName} 原对话链接为空`, "warn");
+    return;
+  }
   const page = Math.max(1, Number(pageNumber) || 1);
   const payload = syncPayload(page, reason);
 
   if (state.embedded) {
     await postToParent("open", payload, 7000);
-    setStatus("Gemini chat switched", "ok");
+    setStatus(`${providerName} 原对话已切换`, "ok");
     return;
   }
 
-  window.open(state.deck.geminiUrl, "gemsync-gemini");
-  setStatus("Gemini chat opened", "ok");
+  window.open(targetUrl, provider === "chatgpt" ? "gemsync-chatgpt" : "gemsync-gemini");
+  setStatus(`${providerName} 原对话已打开`, "ok");
 }
 
 function buildRail() {
@@ -896,6 +961,7 @@ function normalizeSubjectConfig(config, configUrl) {
     .filter((deck) => !state.cachedOnly || deck.transcriptUrl)
     .map((deck) => ({
       ...deck,
+      provider: deck.provider || config.provider || "gemini",
       pdfUrl: new URL(deck.pdfUrl, baseUrl).toString(),
       transcriptUrl: deck.transcriptUrl ? new URL(deck.transcriptUrl, baseUrl).toString() : "",
     }));
@@ -975,80 +1041,6 @@ async function loadDeck(deckId, initialPage = 1, options = {}) {
     }
   }
   setStatus("就绪", "ok");
-}
-
-async function init() {
-  const hash = new URLSearchParams(location.hash.replace(/^#/, ""));
-  state.embedded = window.parent !== window || hash.get("embed") === "1";
-  state.cachedOnly = hash.get("cached") === "1";
-  document.body.classList.toggle("embedded", state.embedded);
-
-  setStatus("读取配置", "busy");
-  const response = await fetch("./config.json", { cache: "no-store" });
-  if (!response.ok) throw new Error(`配置读取失败：${response.status}`);
-  state.config = normalizeSubjectConfig(await response.json(), location.href);
-  if (!state.config.decks.length) throw new Error("这个学科还没有可用的离线缓存章节");
-
-  for (const deck of state.config.decks) {
-    const option = document.createElement("option");
-    option.value = deck.id;
-    option.textContent = deck.title;
-    elements.deckSelect.append(option);
-  }
-
-  elements.deckSelect.addEventListener("change", () => {
-    loadDeck(elements.deckSelect.value, 1, { switchGemini: true }).catch((error) => {
-      console.error(error);
-      setStatus(error.message, "warn");
-    });
-  });
-  elements.prevPage.addEventListener("click", () => goToPage(state.currentPage - 1));
-  elements.nextPage.addEventListener("click", () => goToPage(state.currentPage + 1));
-  elements.pageInput.addEventListener("change", () => goToPage(elements.pageInput.value));
-  elements.pageInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.currentTarget.blur();
-      goToPage(elements.pageInput.value);
-    }
-  });
-  elements.syncPage.addEventListener("click", () => sendSync("manual"));
-  elements.deepSyncPage.addEventListener("click", () => sendSync("manual", { deep: true }));
-  elements.bindPage.addEventListener("click", bindCurrentPage);
-  elements.openGemini.addEventListener("click", openGemini);
-  elements.autoSync.checked = localStorage.getItem("gemsync:autoSync") === "true";
-  elements.autoSync.addEventListener("change", () => {
-    if (elements.autoSync.checked) {
-      setAutoSyncEnabled(true);
-      scheduleAutoSync();
-    } else {
-      setAutoSyncEnabled(false, "自动同步已关闭");
-    }
-  });
-  elements.viewer.addEventListener("scroll", () => {
-    renderAround(state.currentPage);
-    requestVisiblePageUpdate();
-  }, { passive: true });
-  installPdfInputGuards();
-
-  let resizeTimer = 0;
-  window.addEventListener("resize", () => {
-    clearTimeout(resizeTimer);
-    resizeTimer = setTimeout(() => {
-      state.rendered.clear();
-      for (const frame of elements.pages.querySelectorAll(".page-frame")) {
-        const page = Number(frame.dataset.page);
-        if (Math.abs(page - state.currentPage) <= 2) {
-          frame.replaceChildren(Object.assign(document.createElement("div"), { className: "skeleton" }));
-        }
-      }
-      renderAround(state.currentPage);
-    }, 180);
-  });
-
-  const deckId = hash.get("deck") || state.config.decks[0]?.id;
-  const page = Number(hash.get("page") || 1);
-  elements.deckSelect.value = deckId;
-  await loadDeck(deckId, page);
 }
 
 async function initSubjects() {

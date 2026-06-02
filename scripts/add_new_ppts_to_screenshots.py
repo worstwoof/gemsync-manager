@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add newly supplied PPT/PPTX files to a Gemini PPT screenshot set.
 
-The script appends new deckNN folders under gemini_ppt_screenshots_full,
+The script appends new deckNN folders under DeckSync/shots,
 converts PPT/PPTX -> PDF with PowerPoint or LibreOffice, rasterizes PDF -> PNG
 with Poppler or pypdfium2, and appends entries to manifest.json. It
 intentionally does not edit gemini_progress.json.
@@ -37,7 +37,7 @@ def env_choice(name: str, default: str, choices: set[str]) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Append new PPT/PPTX decks to gemini_ppt_screenshots_full."
+        description="Append new PPT/PPTX decks to DeckSync/shots."
     )
     parser.add_argument(
         "--workspace",
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         "--root",
         type=Path,
         default=None,
-        help="Screenshot root. Defaults to <workspace>/gemini_ppt_screenshots_full.",
+        help="Screenshot root. Defaults to <workspace>/DeckSync/shots.",
     )
     parser.add_argument(
         "--ppt",
@@ -145,6 +145,26 @@ def load_manifest(path: Path) -> list[dict]:
     text = path.read_text(encoding="utf-8-sig")
     data = json.loads(text)
     if not isinstance(data, list):
+        if isinstance(data, dict) and isinstance(data.get("decks"), list):
+            migrated: list[dict] = []
+            for order, item in enumerate(data["decks"], start=1):
+                if not isinstance(item, dict):
+                    continue
+                migrated.append(
+                    {
+                        "order": order,
+                        "deckIndex": item.get("deckIndex")
+                        or item.get("deck")
+                        or item.get("folder")
+                        or order,
+                        "source": item.get("source")
+                        or item.get("title")
+                        or item.get("folder")
+                        or "",
+                        "path": item.get("path") or "",
+                    }
+                )
+            return migrated
         raise SystemExit(f"Expected manifest list at {path}")
     return data
 
@@ -239,7 +259,9 @@ def should_skip_source_dir(path: Path) -> bool:
     name = path.name.lower()
     return name in {
         "gemini_ppt_screenshots_full",
+        "DeckSync",
         "chrome-gemini-automation-profile",
+        "chrome-chatgpt-automation-profile",
         "node_modules",
         ".git",
     }
@@ -261,7 +283,9 @@ def workspace_ppts(workspace: Path) -> list[Path]:
             relative_parts = ()
         if any(part.lower() in {
             "gemini_ppt_screenshots_full",
+            "DeckSync",
             "chrome-gemini-automation-profile",
+            "chrome-chatgpt-automation-profile",
             "node_modules",
             ".git",
         } for part in relative_parts):
@@ -573,7 +597,7 @@ def main() -> int:
     root = (
         args.root.expanduser().resolve()
         if args.root
-        else workspace / "gemini_ppt_screenshots_full"
+        else workspace / "DeckSync" / "shots"
     )
     manifest_path = root / "manifest.json"
     pdf_dir = root / "_pdf"

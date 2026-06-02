@@ -76,6 +76,7 @@ async function loadConfig() {
   state.config = { ...config, decks: cachedDecks };
   state.deck = {
     ...deck,
+    provider: deck.provider || config.provider || "gemini",
     transcriptUrl: deck.transcriptUrl ? new URL(deck.transcriptUrl, configUrl).toString() : "",
   };
   state.transcript = await readJson(state.deck.transcriptUrl);
@@ -465,6 +466,20 @@ function renderEmbeddedMath(root) {
   }
 }
 
+function markStandaloneCodeParagraphs(root) {
+  for (const paragraph of root.querySelectorAll("p")) {
+    const code = paragraph.querySelector(":scope > code:only-child");
+    if (!code) continue;
+    if (paragraph.textContent.trim() === code.textContent.trim()) {
+      paragraph.classList.add("code-only");
+    }
+  }
+}
+
+function providerForRecord(record = null) {
+  return record?.provider || state.transcript?.provider || state.deck?.provider || state.config?.provider || "gemini";
+}
+
 function renderMarkdownHtml(text) {
   const format = makeFormatStore();
   const source = geminiTextToMarkdown(text, format);
@@ -496,16 +511,298 @@ function renderMarkdownHtml(text) {
   }, withFormatting);
 }
 
+function chatGptLanguageInfo(value) {
+  const key = String(value || "").trim().toLowerCase();
+  const languages = {
+    c: { fence: "c", label: "C" },
+    "c++": { fence: "cpp", label: "C++" },
+    cpp: { fence: "cpp", label: "C++" },
+    "c/c++": { fence: "cpp", label: "C/C++" },
+    python: { fence: "python", label: "Python" },
+    py: { fence: "python", label: "Python" },
+    java: { fence: "java", label: "Java" },
+    javascript: { fence: "javascript", label: "JavaScript" },
+    js: { fence: "javascript", label: "JavaScript" },
+    sql: { fence: "sql", label: "SQL" },
+    asm: { fence: "asm", label: "asm" },
+    assembly: { fence: "asm", label: "asm" },
+  };
+  return languages[key] || null;
+}
+
+function isLikelyCodeLine(line) {
+  const value = String(line || "").trim();
+  if (!value) return false;
+  if (/^(#include|#define|#ifdef|#ifndef|#endif)\b/.test(value)) return true;
+  if (/^(public|private|protected|default)\s*:$/.test(value)) return true;
+  if (/^};?$/.test(value)) return true;
+  if (/^[{}]$/.test(value)) return true;
+  if (/^(int|float|double|char|long|short|void|bool|string|auto|const|return|for|while|do|if|else|switch|case|break|continue|struct|class|using|namespace|template|typename)\b/.test(value)) return true;
+  if (/^(printf|scanf|puts|gets|fopen|fclose|fread|fwrite|malloc|free|cout|cin|MOV|ADD|SUB|JMP)\b/i.test(value)) return true;
+  if (/^(std::)?[A-Za-z_]\w*(?:<[^>]+>)?\s+[A-Za-z_]\w*(?:\s*[;=({])/.test(value)) return true;
+  if (/^[A-Za-z_]\w*\s*(=|\+=|-=|\+\+|--)/.test(value)) return true;
+  if (/[\u4e00-\u9fa5]/u.test(value)) return false;
+  return /[;{}#()<>=%+\-*/&|[\]]/.test(value) && /[A-Za-z0-9_]/.test(value);
+}
+
+function chatGptHeadingDepth(value) {
+  const trimmed = String(value || "").trim();
+  if (/^[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]+\u3001\S+/u.test(trimmed)) return 2;
+  return 0;
+}
+
+function formatChatGptInlineMarkdown(value) {
+  return String(value || "").replace(
+    /(^|[^`A-Za-z0-9_])\b(for|while|if|else|switch|case|printf|scanf|return|break|continue|int|float|double|char)\b(?![`A-Za-z0-9_])/g,
+    (_match, prefix, token) => `${prefix}\`${token}\``,
+  );
+}
+
+function isChatGptShortDisplayLine(line) {
+  const trimmed = String(line || "").trim();
+  return (
+    trimmed.length >= 2
+    && trimmed.length <= 18
+    && !/[\u3002\uff01\uff1f.!?\uff1b;\uff0c,\u3001\uff1a:]$/u.test(trimmed)
+    && !/^(?:\u5982\u4f55|\u8fd9|\u90a3|\u6240\u4ee5|\u56e0\u4e3a|\u4f8b\u5982|\u6216\u8005|\u5982\u679c|\u4f46\u662f|\u53ef\u4ee5|\u9700\u8981|\u8bf4\u660e)/u.test(trimmed)
+  );
+}
+
+function shouldJoinChatGptParagraph(previous, current) {
+  const before = String(previous || "").trim();
+  const after = String(current || "").trim();
+  if (!before || !after) return false;
+  if (isChatGptShortDisplayLine(before) && isChatGptShortDisplayLine(after)) return true;
+  if (/[\uff1b;]$/u.test(before)) return true;
+  if (/^\u6240\u4ee5.+[\uff1a:]$/u.test(before)) return true;
+  if (/^(?:\u56e0\u4e3a|\u800c\u4e14|\u5e76\u4e14|\u540c\u65f6)/u.test(after) && !/[\uff1a:]$/u.test(before)) return true;
+  return false;
+}
+
+function chatGptParagraphLine(line) {
+  const trimmed = String(line || "").trim();
+  const colon = trimmed.match(/^([^:\uff1a\n]{2,18})([:\uff1a])\s*(.+)$/u);
+  if (colon) return `**${colon[1]}**${colon[2]}${formatChatGptInlineMarkdown(colon[3])}`;
+  if (isChatGptShortDisplayLine(trimmed)) {
+    return `**${formatChatGptInlineMarkdown(trimmed)}**`;
+  }
+  return formatChatGptInlineMarkdown(line);
+}
+
+function chatGptTextToMarkdown(text) {
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  const paragraph = [];
+
+  function pushParagraph() {
+    if (!paragraph.length) return;
+    out.push(paragraph.map(chatGptParagraphLine).join("\n"));
+    out.push("");
+    paragraph.length = 0;
+  }
+
+  function pushBlock(value) {
+    pushParagraph();
+    out.push(value);
+    out.push("");
+  }
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed) {
+      pushParagraph();
+      continue;
+    }
+
+    const language = chatGptLanguageInfo(trimmed);
+    if (language && isLikelyCodeLine(lines[index + 1] || "")) {
+      const code = [];
+      index += 1;
+      while (index < lines.length) {
+        const codeLine = lines[index];
+        if (!codeLine.trim()) {
+          if (code.length && isLikelyCodeLine(lines[index + 1] || "")) {
+            code.push("");
+            index += 1;
+            continue;
+          }
+          break;
+        }
+        if (!isLikelyCodeLine(codeLine)) {
+          index -= 1;
+          break;
+        }
+        code.push(codeLine);
+        index += 1;
+      }
+      pushBlock(`\`\`\`${language.fence}\n${code.join("\n")}\n\`\`\``);
+      continue;
+    }
+
+    const headingDepth = chatGptHeadingDepth(trimmed);
+    if (headingDepth) {
+      pushBlock(`${"#".repeat(headingDepth)} ${trimmed}`);
+      continue;
+    }
+
+    if (paragraph.length && !shouldJoinChatGptParagraph(paragraph[paragraph.length - 1], trimmed)) {
+      pushParagraph();
+    }
+    paragraph.push(trimmed);
+  }
+
+  pushParagraph();
+  return out.join("\n").trim();
+}
+
+function renderChatGptMarkdownHtml(text) {
+  const { source: mathSource, math } = stashMath(chatGptTextToMarkdown(text));
+  const renderer = window.marked?.Renderer ? new window.marked.Renderer() : null;
+  if (renderer) {
+    renderer.html = (token) => escapeHtml(typeof token === "string" ? token : token?.text || token?.raw || "");
+  }
+  const html = window.marked?.parse
+    ? window.marked.parse(mathSource, {
+      async: false,
+      breaks: true,
+      gfm: true,
+      renderer,
+    })
+    : `<p>${escapeHtml(mathSource).replace(/\n/g, "<br>")}</p>`;
+
+  return math.reduce((result, item, index) => {
+    const rendered = renderMathToken(item);
+    const token = `GEMSYNCMATH${index}TOKEN`;
+    if (item.displayMode) {
+      return result
+        .replaceAll(`<p>${token}</p>`, `<div class="math-display">${rendered}</div>`)
+        .replaceAll(token, `<span class="math-inline">${rendered}</span>`);
+    }
+    return result.replaceAll(token, `<span class="math-inline">${rendered}</span>`);
+  }, html);
+}
+
+function codeLanguageLabel(code) {
+  const className = Array.from(code?.classList || []).find((name) => /^language-/i.test(name)) || "";
+  const language = className.replace(/^language-/i, "");
+  if (!language) return "代码";
+  if (language === "cpp") return "C++";
+  if (language === "c") return "C";
+  if (language === "javascript") return "JavaScript";
+  return language;
+}
+
+function highlightChatGptCode(value, language) {
+  const raw = String(value || "");
+  if (!/^(c|cpp|javascript|java)$/i.test(language || "")) return escapeHtml(raw);
+
+  const keywords = new Set([
+    "#include",
+    "int",
+    "float",
+    "double",
+    "char",
+    "long",
+    "short",
+    "void",
+    "return",
+    "for",
+    "while",
+    "do",
+    "if",
+    "else",
+    "switch",
+    "case",
+    "break",
+    "continue",
+    "struct",
+    "class",
+    "using",
+    "namespace",
+  ]);
+  const functions = new Set(["printf", "scanf", "cout", "cin", "main"]);
+  const tokenPattern = /"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#include\b|\b\d+(?:\.\d+)?\b|\b[A-Za-z_]\w*\b/g;
+  let result = "";
+  let cursor = 0;
+  let match;
+
+  while ((match = tokenPattern.exec(raw))) {
+    const token = match[0];
+    result += escapeHtml(raw.slice(cursor, match.index));
+    const escaped = escapeHtml(token);
+    if (/^["']/.test(token)) {
+      result += `<span class="code-token-string">${escaped}</span>`;
+    } else if (/^\d/.test(token)) {
+      result += `<span class="code-token-number">${escaped}</span>`;
+    } else if (keywords.has(token)) {
+      result += `<span class="code-token-keyword">${escaped}</span>`;
+    } else if (functions.has(token)) {
+      result += `<span class="code-token-function">${escaped}</span>`;
+    } else {
+      result += escaped;
+    }
+    cursor = match.index + token.length;
+  }
+
+  result += escapeHtml(raw.slice(cursor));
+  return result;
+}
+
+function enhanceChatGptCodeBlocks(root) {
+  for (const pre of root.querySelectorAll("pre")) {
+    if (pre.closest(".chatgpt-code-block")) continue;
+    const code = pre.querySelector("code");
+    const language = Array.from(code?.classList || [])
+      .find((name) => /^language-/i.test(name))
+      ?.replace(/^language-/i, "") || "";
+    if (code) code.innerHTML = highlightChatGptCode(code.textContent || "", language);
+    const shell = document.createElement("div");
+    shell.className = "chatgpt-code-block";
+
+    const header = document.createElement("div");
+    header.className = "chatgpt-code-header";
+    const label = document.createElement("span");
+    label.textContent = `</> ${codeLanguageLabel(code)}`;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "chatgpt-copy-code";
+    copy.setAttribute("aria-label", "复制代码");
+    copy.title = "复制代码";
+    copy.textContent = "⧉";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(code?.textContent || pre.textContent || "");
+        copy.textContent = "✓";
+        window.setTimeout(() => { copy.textContent = "⧉"; }, 1200);
+      } catch {
+        copy.textContent = "!";
+        window.setTimeout(() => { copy.textContent = "⧉"; }, 1200);
+      }
+    });
+    header.append(label, copy);
+
+    pre.replaceWith(shell);
+    shell.append(header, pre);
+  }
+}
+
 function renderAnswer(element, recordOrText) {
   const record = typeof recordOrText === "object" && recordOrText ? recordOrText : null;
   const text = record ? record.assistantText || "" : String(recordOrText || "");
+  const provider = providerForRecord(record);
   element.dataset.rawText = String(text || "");
+  element.classList.toggle("chatgpt-answer", provider === "chatgpt");
   if (record?.assistantHtml) {
     element.innerHTML = sanitizeStoredHtml(record.assistantHtml);
     renderEmbeddedMath(element);
+  } else if (provider === "chatgpt") {
+    element.innerHTML = renderChatGptMarkdownHtml(text);
   } else {
     element.innerHTML = renderMarkdownHtml(text);
   }
+  markStandaloneCodeParagraphs(element);
+  if (provider === "chatgpt") enhanceChatGptCodeBlocks(element);
   renderInteractiveViews(element, record);
 }
 
@@ -651,6 +948,36 @@ function recordForPromptIndex(promptIndex) {
   return transcriptRecords()[clampPromptIndex(promptIndex) - 1] || null;
 }
 
+function mappedPagesForRecord(record) {
+  if (!recordHasImage(record)) return [];
+  const pages = Array.isArray(record.pages) && record.pages.length
+    ? record.pages
+    : record.pageStart && record.pageEnd
+      ? Array.from(
+        { length: Math.max(1, Number(record.pageEnd) - Number(record.pageStart) + 1) },
+        (_value, offset) => Number(record.pageStart) + offset,
+      )
+      : [record.page];
+  return pages
+    .map((item) => pageIfInRange(item))
+    .filter(Boolean);
+}
+
+function firstMappedPageForRecord(record) {
+  return mappedPagesForRecord(record)[0] || null;
+}
+
+function transcriptHasExplicitPageMappings() {
+  return transcriptRecords().some((record) => mappedPagesForRecord(record).length > 0);
+}
+
+function promptIndexFromMappedPage(page) {
+  const targetPage = pageIfInRange(page);
+  if (!targetPage) return null;
+  const index = transcriptRecords().findIndex((record) => mappedPagesForRecord(record).includes(targetPage));
+  return index >= 0 ? clampPromptIndex(index + 1) : null;
+}
+
 function pageStorageKey(pageNumber) {
   return `gemsync:${state.subjectId}:${state.deckId}:page:${pageNumber}`;
 }
@@ -734,6 +1061,10 @@ function pageFromPromptIndex(promptIndex) {
   const exactPage = pageIfInRange(exact?.pageNumber);
   if (exactPage) return exactPage;
 
+  const recordPage = firstMappedPageForRecord(recordForPromptIndex(index));
+  if (recordPage) return recordPage;
+  if (transcriptHasExplicitPageMappings()) return null;
+
   const entries = bindingEntriesForCurrentDeck()
     .filter((entry) => Number(entry.promptIndex) > 0 && Number(entry.pageNumber) > 0)
     .sort((a, b) => Number(a.promptIndex) - Number(b.promptIndex) || Number(a.pageNumber) - Number(b.pageNumber));
@@ -756,18 +1087,23 @@ function pageFromPromptIndex(promptIndex) {
 }
 
 function promptIndexForPage(page, payload = {}) {
+  const targetPage = Math.max(1, Number(page) || Number(state.page) || 1);
   const binding = payload?.binding && !payload.binding.autoLearned ? payload.binding : null;
   if (binding?.targetPromptIndex || binding?.promptIndex) {
     return clampPromptIndex(binding.targetPromptIndex || binding.promptIndex);
   }
-  if (Number(payload?.targetPromptIndex) > 0) {
-    return clampPromptIndex(payload.targetPromptIndex);
-  }
 
-  const targetPage = Math.max(1, Number(page) || Number(state.page) || 1);
   const exact = readLocalBinding(pageStorageKey(targetPage));
   const exactPrompt = Number(exact?.promptIndex || exact?.targetPromptIndex || 0);
   if (exactPrompt > 0) return clampPromptIndex(exactPrompt);
+
+  const mappedPrompt = promptIndexFromMappedPage(targetPage);
+  if (mappedPrompt) return mappedPrompt;
+  if (transcriptHasExplicitPageMappings()) return null;
+
+  if (Number(payload?.targetPromptIndex) > 0) {
+    return clampPromptIndex(payload.targetPromptIndex);
+  }
 
   const entries = bindingEntriesForCurrentDeck()
     .filter((entry) => Number(entry.pageNumber) > 0 && Number(entry.promptIndex) > 0)
@@ -1009,7 +1345,10 @@ async function openCachedLiveGemini(payload = {}) {
   if (payload.reason === "deck-change" || payload.reason === "subject-change") {
     return loadCachedDeckFromPayload(payload);
   }
-  const url = payload.geminiUrl || state.transcript?.conversationUrl || state.deck?.geminiUrl;
+  const url = payload.geminiUrl || payload.chatgptUrl || state.transcript?.conversationUrl || state.deck?.geminiUrl || state.deck?.chatgptUrl;
+  if (String(url || "").startsWith("openai-response:")) {
+    return { ok: false, error: "ChatGPT API 对话已缓存到本地，没有可打开的网页对话链接。" };
+  }
   if (url) window.open(url, "_blank", "noopener");
   return { ok: true };
 }
@@ -1044,6 +1383,7 @@ function createSlidePreview(record) {
   preview.className = "slide-preview";
   const imageUrl = resolveTranscriptUrl(record.slideImageUrl || record.imageUrl || record.thumbnailUrl);
   const label = pageRangeLabel(record.pageStart || record.page, record.pageEnd || record.page);
+  const provider = record.provider || state.transcript?.provider || state.deck?.provider || state.config?.provider || "gemini";
 
   if (imageUrl) {
     const image = document.createElement("img");
@@ -1054,7 +1394,11 @@ function createSlidePreview(record) {
   }
 
   preview.classList.add("empty");
-  preview.textContent = record.missingImage ? "未上传图片" : (label || `第 ${record.page || record.turn} 页`);
+  preview.textContent = record.unmatchedUserImage
+    ? "图片未匹配"
+    : record.missingImage && provider === "gemini"
+      ? "未上传图片"
+      : (label || `第 ${record.page || record.turn} 页`);
   return preview;
 }
 
@@ -1162,10 +1506,15 @@ function createTurn(record, index) {
   meta.className = "turn-meta";
   const mappedEnd = mappedPage ? Math.min(Number(state.transcript?.totalPages || mappedPage), mappedPage + configuredPagesPerPrompt() - 1) : 0;
   const storedLabel = pageRangeLabel(record.pageStart || mappedPage, record.pageEnd || mappedEnd);
+  const providerName = (record.provider || state.transcript?.provider || state.deck?.provider || state.config?.provider) === "chatgpt" ? "ChatGPT" : "Gemini";
   const pageLabel = mappedPage
-    ? `默认${storedLabel || pageRangeLabel(mappedPage, mappedEnd)}`
-    : "多出来的 Gemini 记录";
-  meta.textContent = `${pageLabel} · Gemini 原始记录 ${turnNumber}`;
+    ? `${record.duplicateSlideRecord ? "重复" : record.mappingVerified === false ? "未校验" : "匹配"}${storedLabel || pageRangeLabel(mappedPage, mappedEnd)}`
+    : record.unmatchedUserImage
+      ? `图片未匹配${record.expectedPage ? ` · 预计第 ${record.expectedPage} 页` : ""}`
+      : record.missingImage
+        ? `未上传图片${record.expectedPage ? ` · 预计第 ${record.expectedPage} 页` : ""}`
+        : `多出来的 ${providerName} 记录`;
+  meta.textContent = `${pageLabel} · ${providerName} 原始记录 ${turnNumber}`;
 
   const answer = document.createElement("div");
   answer.className = "answer";
@@ -1194,8 +1543,10 @@ function renderRecent(records) {
     const mappedEnd = mappedPage ? Math.min(Number(state.transcript?.totalPages || mappedPage), mappedPage + configuredPagesPerPrompt() - 1) : 0;
     const storedLabel = pageRangeLabel(record.pageStart || mappedPage, record.pageEnd || mappedEnd);
     item.setAttribute("aria-label", mappedPage
-      ? `第 ${turnNumber} 条记录，默认对应${storedLabel || pageRangeLabel(mappedPage, mappedEnd)}`
-      : `第 ${turnNumber} 条记录，没有默认对应页`);
+      ? `第 ${turnNumber} 条记录，对应${storedLabel || pageRangeLabel(mappedPage, mappedEnd)}`
+      : record.unmatchedUserImage
+        ? `第 ${turnNumber} 条记录，图片未匹配`
+        : `第 ${turnNumber} 条记录，没有默认对应页`);
     item.addEventListener("click", () => {
       const selector = `.turn[data-prompt-index="${promptIndex}"], .turn[data-turn="${turnNumber}"]`;
       const turn = elements.chatScroll.querySelector(selector);
@@ -1213,9 +1564,11 @@ function renderRecent(records) {
 }
 
 function renderTranscript() {
-  elements.chatTitle.textContent = state.transcript.title || state.deck.title || "Gemini 全记录";
+  const provider = state.transcript?.provider || state.deck?.provider || state.config?.provider || "gemini";
+  const providerName = provider === "chatgpt" ? "ChatGPT" : "Gemini";
+  elements.chatTitle.textContent = state.transcript.title || state.deck.title || `${providerName} 全记录`;
   elements.openLiveGemini.onclick = () => {
-    const url = state.transcript.conversationUrl || state.deck?.geminiUrl;
+    const url = state.transcript.conversationUrl || state.deck?.geminiUrl || state.deck?.chatgptUrl;
     if (url) window.open(url, "_blank", "noopener");
   };
 

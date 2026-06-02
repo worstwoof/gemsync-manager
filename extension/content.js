@@ -1,17 +1,22 @@
 (() => {
   const HOST_ID = "codex-gemini-reading-marker";
-  const CONTENT_VERSION = "1.7.2";
+  const CONTENT_VERSION = "1.7.7";
   const MIN_SCROLL_DELTA = 80;
   const SHOW_TOP_AFTER = 280;
   const STORAGE_PREFIX = "gemini-reading-marker:";
   const DEEP_TOP_TIMEOUT_MS = 300000;
   const MARKER_SCROLL_TIMEOUT_MS = 300000;
-  const GEMSYNC_SERVER = "http://127.0.0.1:5177";
+  const GEMSYNC_DEFAULT_SERVER = "http://127.0.0.1:5188";
+  const GEMSYNC_SERVER_KEY = "gemsync:manager-server";
+  const GEMSYNC_SERVER_CANDIDATES = [
+    GEMSYNC_DEFAULT_SERVER,
+    ...Array.from({ length: 99 }, (_, index) => `http://127.0.0.1:${5189 + index}`),
+  ];
   const GEMSYNC_PANEL_PATH = "pdf-panel/index.html";
   const OLDER_LOAD_NUDGE_PX = 180;
   const SYNC_TOP_MARGIN_PX = 18;
   const GEMSYNC_PENDING_DOCK_KEY = "gemsync:pending-pdf-dock";
-  const STALE_LOCAL_PANEL_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost):5177(?:\/|$)/i;
+  const STALE_LOCAL_PANEL_RE = /^https?:\/\/(?:127\.0\.0\.1|localhost):(5177|5188)(?:\/|$)/i;
 
   const removeExistingInstance = () => {
     document.getElementById(HOST_ID)?.remove();
@@ -33,6 +38,7 @@
   }
 
   let chromeContextInvalidated = false;
+  let gemSyncServer = localStorage.getItem(GEMSYNC_SERVER_KEY) || GEMSYNC_DEFAULT_SERVER;
 
   const isContextInvalidatedError = (error) => {
     return /Extension context invalidated|context invalidated/i.test(String(error?.message || error || ""));
@@ -107,7 +113,7 @@
       return configs;
     }
 
-    throw new Error("PDF 面板配置只能从扩展内读取。请刷新 Gemini 页面，或者在 chrome://extensions 里重新加载 GemSync 插件。");
+    throw new Error("PDF 面板配置只能从扩展内读取。请刷新页面，或者在 chrome://extensions 里重新加载 DeckSync 插件。");
   };
 
   const readLocalJson = (key) => {
@@ -131,13 +137,66 @@
     },
   };
 
+  const isChatGptPage = () => /(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/i.test(location.hostname);
+  const isGeminiPage = () => /(^|\.)gemini\.google\.com$/i.test(location.hostname);
+  const currentProvider = () => isChatGptPage() ? "chatgpt" : "gemini";
+
+  const conversationIdFromUrl = (url) => {
+    try {
+      const parsed = new URL(url, location.href);
+      if (/(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/i.test(parsed.hostname)) {
+        return parsed.pathname.match(/^\/c\/([^/?#]+)/)?.[1] || "";
+      }
+      if (/(^|\.)gemini\.google\.com$/i.test(parsed.hostname)) {
+        return parsed.pathname.match(/^\/app\/([^/?#]+)/)?.[1] || "";
+      }
+      return "";
+    } catch {
+      return "";
+    }
+  };
+
+  const fetchWithTimeout = async (url, options = {}, timeoutMs = 650) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const checkGemSyncServer = async (server) => {
+    try {
+      const response = await fetchWithTimeout(`${server}/api/state`, { cache: "no-store" });
+      if (!response.ok) return false;
+      const data = await response.json();
+      return data?.defaults?.appName === "DeckSync";
+    } catch {
+      return false;
+    }
+  };
+
+  const resolveGemSyncServer = async () => {
+    if (gemSyncServer && await checkGemSyncServer(gemSyncServer)) return gemSyncServer;
+    for (const server of GEMSYNC_SERVER_CANDIDATES) {
+      if (await checkGemSyncServer(server)) {
+        gemSyncServer = server;
+        localStorage.setItem(GEMSYNC_SERVER_KEY, server);
+        return server;
+      }
+    }
+    return "";
+  };
+
   const getConversationKey = () => {
-    const match = /^\/app\/([^/?#]+)/.exec(location.pathname);
+    const id = getConversationId();
+    const match = id ? [null, id] : null;
     return match ? `${STORAGE_PREFIX}${match[1]}` : null;
   };
 
   const getConversationId = () => {
-    return /^\/app\/([^/?#]+)/.exec(location.pathname)?.[1] || "";
+    return conversationIdFromUrl(location.href);
   };
 
   const host = document.createElement("div");
@@ -1136,8 +1195,10 @@
   const messageRootFor = (element) => {
     return element.closest?.([
       "user-query",
+      "[data-message-author-role='user']",
       "[data-test-id*='user']",
       "[data-testid*='user']",
+      "[data-testid^='conversation-turn-']",
       "[class*='user-query']",
       "article",
       "[role='listitem']",
@@ -1250,8 +1311,10 @@
     const promptTexts = pptPromptVariants(prompt);
     const selector = [
       "user-query",
+      "[data-message-author-role='user']",
       "[data-test-id*='user']",
       "[data-testid*='user']",
+      "[data-testid^='conversation-turn-'] [data-message-author-role='user']",
       "[class*='user-query']",
       "[class*='query-text']",
       "[class*='query-content']",
@@ -1315,6 +1378,22 @@
 
   const sendGeminiVisiblePageToPdf = (position) => {
     if (!pdfDock || !position || !gemSyncPdfState.autoSyncEnabled) return;
+    if (pdfDock.dataset.mode === "inline") {
+      const deck = inlineDockDeck || {
+        id: gemSyncPdfState.deckId,
+        title: gemSyncPdfState.deckTitle,
+        totalPages: gemSyncPdfState.totalPages,
+        pagePrompt: gemSyncPdfState.pagePrompt,
+        promptStartIndex: gemSyncPdfState.promptStartIndex,
+        pagesPerPrompt: gemSyncPdfState.pagesPerPrompt,
+        subjectId: gemSyncPdfState.subjectId,
+        subjectTitle: gemSyncPdfState.subjectTitle,
+        provider: gemSyncPdfState.provider,
+      };
+      const page = inlinePageFromPromptIndex(deck, position.promptIndex || position.imagePromptIndex);
+      if (page) updateInlinePdfDock(deck, page, { silent: true });
+      return;
+    }
     const iframe = pdfDock.querySelector("iframe");
     if (!iframe?.contentWindow) return;
 
@@ -1660,12 +1739,52 @@
     pdfDockStyle.textContent = `
       html.${HOST_ID}-pdf-open {
         --gemsync-pdf-width: 50vw;
+        overflow-x: hidden !important;
       }
 
       html.${HOST_ID}-pdf-open body {
         width: calc(100vw - var(--gemsync-pdf-width)) !important;
+        min-width: 0 !important;
         max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
+        margin-right: var(--gemsync-pdf-width) !important;
         overflow-x: hidden !important;
+      }
+
+      html.${HOST_ID}-pdf-open body > div,
+      html.${HOST_ID}-pdf-open body > div:first-child,
+      html.${HOST_ID}-pdf-open #__next,
+      html.${HOST_ID}-pdf-open #root,
+      html.${HOST_ID}-pdf-open main,
+      html.${HOST_ID}-pdf-open [role="main"] {
+        width: auto !important;
+        right: var(--gemsync-pdf-width) !important;
+        max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
+      }
+
+      html.${HOST_ID}-pdf-open body :where(main, [role="main"], #thread, .composer-parent, [data-testid*="conversation"]) {
+        max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
+      }
+
+      html.${HOST_ID}-pdf-open body :where([class~="inset-0"], [class~="right-0"]) {
+        right: var(--gemsync-pdf-width) !important;
+        width: auto !important;
+        max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
+      }
+
+      html.${HOST_ID}-pdf-open #thread-bottom-container,
+      html.${HOST_ID}-pdf-open [data-testid="composer"],
+      html.${HOST_ID}-pdf-open [class~="w-screen"],
+      html.${HOST_ID}-pdf-open [class~="min-w-screen"] {
+        width: calc(100vw - var(--gemsync-pdf-width)) !important;
+        min-width: 0 !important;
+        max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
+      }
+
+      html.${HOST_ID}-pdf-open #thread-bottom-container,
+      html.${HOST_ID}-pdf-open [class~="bottom-0"][class~="fixed"],
+      html.${HOST_ID}-pdf-open [class~="fixed"][class~="bottom-0"] {
+        right: var(--gemsync-pdf-width) !important;
+        max-width: calc(100vw - var(--gemsync-pdf-width)) !important;
       }
 
       #${HOST_ID}-pdf-dock {
@@ -1745,32 +1864,318 @@
         border: 0;
         background: transparent;
       }
+
+      #${HOST_ID}-pdf-dock[data-mode="inline"] {
+        grid-template-rows: minmax(0, 1fr);
+        background: linear-gradient(180deg, #f8fbff 0%, #eef3f8 100%);
+        font: 14px/1.45 "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+      }
+
+      #${HOST_ID}-pdf-dock[data-mode="inline"] .gemsync-dock-bar {
+        display: none;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel {
+        --gemsync-inline-bg: #eef3f8;
+        --gemsync-inline-panel: rgba(255, 255, 255, 0.72);
+        --gemsync-inline-ink: #172033;
+        --gemsync-inline-muted: #66758a;
+        --gemsync-inline-line: rgba(148, 163, 184, 0.28);
+        --gemsync-inline-line-strong: rgba(100, 116, 139, 0.36);
+        --gemsync-inline-blue: #2563eb;
+        --gemsync-inline-blue-dark: #1d4ed8;
+        --gemsync-inline-green: #16833a;
+        --gemsync-inline-shadow: 0 20px 50px rgba(15, 23, 42, 0.13);
+        box-sizing: border-box;
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: auto auto auto minmax(0, 1fr);
+        gap: 10px;
+        padding: 10px 12px 0;
+        background: linear-gradient(180deg, #f8fbff 0%, var(--gemsync-inline-bg) 100%);
+        color: var(--gemsync-inline-ink);
+        overflow: hidden;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel *,
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel *::before,
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel *::after {
+        box-sizing: border-box;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-top {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 10px;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-actions {
+        display: grid;
+        grid-template-columns: minmax(160px, 1fr) auto auto auto auto auto;
+        gap: 10px;
+        align-items: center;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-select,
+      #${HOST_ID}-pdf-dock .gemsync-inline-page-input,
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel button {
+        height: 36px;
+        border: 1px solid var(--gemsync-inline-line);
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.68);
+        color: var(--gemsync-inline-ink);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+        font: inherit;
+        -webkit-backdrop-filter: blur(14px) saturate(1.12);
+        backdrop-filter: blur(14px) saturate(1.12);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-select {
+        width: 100%;
+        min-width: 0;
+        padding: 0 12px;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel button {
+        min-width: 36px;
+        padding: 0 12px;
+        cursor: pointer;
+        font-weight: 650;
+        transition: background 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel button:hover,
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel button:focus-visible {
+        border-color: var(--gemsync-inline-line-strong);
+        background: rgba(255, 255, 255, 0.86);
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.78);
+        transform: translateY(-1px);
+        outline: none;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-panel button:active {
+        transform: translateY(0) scale(0.98);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-primary {
+        border-color: rgba(37, 99, 235, 0.55) !important;
+        background: rgba(37, 99, 235, 0.9) !important;
+        color: #fff !important;
+        box-shadow: 0 10px 22px rgba(37, 99, 235, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-pager {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: max-content;
+        padding: 3px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 13px;
+        background: rgba(255, 255, 255, 0.46);
+        -webkit-backdrop-filter: blur(12px) saturate(1.08);
+        backdrop-filter: blur(12px) saturate(1.08);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-pager button {
+        width: 34px;
+        height: 30px;
+        padding: 0;
+        border-radius: 10px;
+        font-size: 23px;
+        line-height: 1;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-page-input {
+        width: 64px;
+        height: 30px;
+        padding: 0 8px;
+        text-align: center;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-total {
+        color: var(--gemsync-inline-muted);
+        white-space: nowrap;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-switch {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+        height: 36px;
+        padding: 0 11px;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.52);
+        color: var(--gemsync-inline-ink);
+        white-space: nowrap;
+        user-select: none;
+        -webkit-backdrop-filter: blur(12px) saturate(1.08);
+        backdrop-filter: blur(12px) saturate(1.08);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-switch input {
+        width: 17px;
+        height: 17px;
+        accent-color: var(--gemsync-inline-blue);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-status {
+        overflow: hidden;
+        padding: 8px 11px;
+        border: 1px solid rgba(22, 131, 58, 0.35);
+        border-radius: 10px;
+        background: rgba(236, 253, 245, 0.78);
+        color: var(--gemsync-inline-green);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7);
+        font-size: 14px;
+        font-weight: 650;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        -webkit-backdrop-filter: blur(14px) saturate(1.1);
+        backdrop-filter: blur(14px) saturate(1.1);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-layout {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: 74px minmax(0, 1fr);
+        margin: 0 -12px;
+        border-top: 1px solid rgba(148, 163, 184, 0.24);
+        overflow: hidden;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-rail {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 7px;
+        overflow: auto;
+        padding: 10px 8px 18px;
+        border-right: 1px solid rgba(148, 163, 184, 0.24);
+        background: rgba(241, 245, 249, 0.72);
+        -webkit-backdrop-filter: blur(16px) saturate(1.08);
+        backdrop-filter: blur(16px) saturate(1.08);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-rail button {
+        width: 100%;
+        min-width: 0;
+        height: 34px;
+        margin: 0;
+        padding: 0;
+        border: 1px solid transparent;
+        border-radius: 10px;
+        background: transparent;
+        color: var(--gemsync-inline-muted);
+        box-shadow: none;
+        font-size: 13px;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-rail button.active {
+        border-color: rgba(37, 99, 235, 0.34);
+        background: rgba(219, 234, 254, 0.78);
+        color: var(--gemsync-inline-blue-dark);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-viewer {
+        min-width: 0;
+        min-height: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
+        padding: 14px 14px 42px;
+        background: linear-gradient(180deg, rgba(241, 245, 249, 0.72), rgba(226, 232, 240, 0.78));
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-pages {
+        display: grid;
+        gap: 18px;
+        max-width: 100%;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-page-label {
+        margin: 0 0 8px;
+        color: var(--gemsync-inline-muted);
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-page {
+        scroll-margin-top: 12px;
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-page.active .gemsync-inline-page-label {
+        color: var(--gemsync-inline-blue-dark);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-page img {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: 100%;
+        height: auto;
+        display: block;
+        background: #fff;
+        border: 1px solid rgba(148, 163, 184, 0.24);
+        border-radius: 10px;
+        box-shadow: var(--gemsync-inline-shadow);
+      }
+
+      #${HOST_ID}-pdf-dock .gemsync-inline-empty {
+        margin: 20px;
+        padding: 12px 14px;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.8);
+        color: #475569;
+        font: 700 13px Google Sans, Roboto, Arial, sans-serif;
+      }
     `;
     document.documentElement.append(pdfDockStyle);
   };
 
-  const geminiConversationIdFromUrl = (url) => {
-    try {
-      return new URL(url, location.href).pathname.match(/^\/app\/([^/?#]+)/)?.[1] || "";
-    } catch {
-      return "";
-    }
-  };
+  const geminiConversationIdFromUrl = conversationIdFromUrl;
 
   const getGemSyncDeck = async (preferredDeckId = "", preferredSubjectId = "") => {
     const conversationId = getConversationId();
+    const provider = currentProvider();
     try {
       const configs = await getGemSyncConfigs();
       for (const { subject, config } of configs) {
         if (preferredSubjectId && subject.id !== preferredSubjectId) continue;
         const deck = (config.decks || []).find((item) => item.id === preferredDeckId)
           || (config.decks || []).find((item) => item.conversationId === conversationId);
-        if (deck) return { ...deck, subjectId: subject.id, subjectTitle: subject.title };
+        if (deck) {
+          return {
+            ...deck,
+            provider: deck.provider || config.provider || "gemini",
+            pagePrompt: deck.pagePrompt || config.pagePrompt || "",
+            prePrompt: deck.prePrompt || config.prePrompt || "",
+            promptStartIndex: deck.promptStartIndex || config.promptStartIndex || 0,
+            pagesPerPrompt: deck.pagesPerPrompt || config.pagesPerPrompt || 1,
+            subjectId: subject.id,
+            subjectTitle: subject.title,
+          };
+        }
       }
-      const first = configs[0];
+      const first = configs.find(({ config }) => (config.provider || "gemini") === provider)
+        || configs.find(({ config }) => (config.decks || []).some((deck) => (deck.provider || config.provider || "gemini") === provider))
+        || configs[0];
       const deck = first?.config?.decks?.[0];
       return deck
-        ? { ...deck, subjectId: first.subject.id, subjectTitle: first.subject.title }
+        ? {
+            ...deck,
+            provider: deck.provider || first.config.provider || "gemini",
+            pagePrompt: deck.pagePrompt || first.config.pagePrompt || "",
+            prePrompt: deck.prePrompt || first.config.prePrompt || "",
+            promptStartIndex: deck.promptStartIndex || first.config.promptStartIndex || 0,
+            pagesPerPrompt: deck.pagesPerPrompt || first.config.pagesPerPrompt || 1,
+            subjectId: first.subject.id,
+            subjectTitle: first.subject.title,
+          }
         : { id: "deck01", title: "PDF" };
     } catch (error) {
       showToast("PDF config not available.");
@@ -1790,16 +2195,427 @@
     } else {
       host.style.right = "";
     }
+    window.dispatchEvent(new Event("resize"));
   };
 
   const closePdfDock = () => {
     pdfDock?.remove();
     pdfDock = null;
+    inlineDockDeck = null;
     setPdfDockOpen(false);
   };
 
   const pdfDockUrlFor = (deck, page = 1) => {
     return getGemSyncPanelUrl({ subjectId: deck?.subjectId || "", deckId: deck?.id || "deck01", page });
+  };
+
+  let inlineDockDeck = null;
+
+  const clampInlinePage = (deck, page) => {
+    const total = Math.max(1, Number(deck?.totalPages) || 1);
+    return Math.max(1, Math.min(total, Math.floor(Number(page) || 1)));
+  };
+
+  const inlineScreenshotUrl = (deck, page) => {
+    const subjectId = deck?.subjectId || "";
+    const deckId = deck?.id || "deck01";
+    const pageId = String(clampInlinePage(deck, page)).padStart(3, "0");
+    return getExtensionUrl(`pdf-panel/subjects/${subjectId}/screenshots/${deckId}/${deckId}_slide${pageId}.png`);
+  };
+
+  const inlinePromptStartIndex = (deck) => {
+    const configured = Number(deck?.promptStartIndex || 0);
+    if (Number.isFinite(configured) && configured > 1) return Math.floor(configured);
+    return String(deck?.prePrompt || "").trim() ? 2 : 1;
+  };
+
+  const inlinePagesPerPrompt = (deck) => {
+    const configured = Number(deck?.pagesPerPrompt || 1);
+    if (!Number.isFinite(configured)) return 1;
+    return Math.max(1, Math.min(3, Math.floor(configured)));
+  };
+
+  const inlinePromptIndexForPage = (deck, page) => {
+    const offset = Math.floor((clampInlinePage(deck, page) - 1) / inlinePagesPerPrompt(deck));
+    return inlinePromptStartIndex(deck) + offset;
+  };
+
+  const inlinePageFromPromptIndex = (deck, promptIndex) => {
+    const index = Number(promptIndex) || 0;
+    if (!index) return null;
+    const offset = index - inlinePromptStartIndex(deck);
+    if (offset < 0) return 1;
+    return clampInlinePage(deck, (offset * inlinePagesPerPrompt(deck)) + 1);
+  };
+
+  const inlineSyncPayload = (deck, page, reason = "manual") => {
+    const pageNumber = clampInlinePage(deck, page);
+    return {
+      subjectId: deck?.subjectId || "",
+      subjectTitle: deck?.subjectTitle || "",
+      deckId: deck?.id || "",
+      deckTitle: deck?.title || "",
+      conversationId: deck?.conversationId || "",
+      geminiUrl: deck?.geminiUrl || "",
+      chatgptUrl: deck?.chatgptUrl || "",
+      provider: deck?.provider || currentProvider(),
+      pagePrompt: deck?.pagePrompt || "",
+      promptStartIndex: inlinePromptStartIndex(deck),
+      pagesPerPrompt: inlinePagesPerPrompt(deck),
+      targetPromptIndex: inlinePromptIndexForPage(deck, pageNumber),
+      hasPromptMapping: true,
+      pageNumber,
+      totalPages: Math.max(1, Number(deck?.totalPages) || 1),
+      reason,
+      deep: false,
+      binding: null,
+    };
+  };
+
+  const configureInlinePdfState = (deck) => {
+    const autoSync = pdfDock?.querySelector(".gemsync-inline-auto-sync");
+    gemSyncPdfState = {
+      ...gemSyncPdfState,
+      ...inlineSyncPayload(deck, Number(pdfDock?.dataset.page) || 1, "inline"),
+      autoSyncEnabled: autoSync ? autoSync.checked : true,
+    };
+  };
+
+  const updateInlineRail = (panel, deck, page) => {
+    const rail = panel.querySelector(".gemsync-inline-rail");
+    if (!rail) return;
+    const total = Math.max(1, Number(deck?.totalPages) || 1);
+    if (rail.dataset.deckId !== (deck?.id || "") || Number(rail.dataset.total) !== total) {
+      rail.replaceChildren();
+      rail.dataset.deckId = deck?.id || "";
+      rail.dataset.total = String(total);
+      for (let itemPage = 1; itemPage <= total; itemPage += 1) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = String(itemPage);
+        button.title = `Page ${itemPage}`;
+        button.addEventListener("click", () => {
+          updateInlinePdfDock(deck, itemPage);
+          const shouldSync = panel.querySelector(".gemsync-inline-auto-sync")?.checked ?? true;
+          if (shouldSync) {
+            syncInlinePageToChat(deck, itemPage, "click").catch((error) => {
+              showToast(error.message);
+            });
+          }
+        });
+        rail.append(button);
+      }
+    }
+    for (const button of rail.querySelectorAll("button")) {
+      const isActive = Number(button.textContent) === page;
+      button.classList.toggle("active", isActive);
+      if (isActive) {
+        button.scrollIntoView({ block: "nearest" });
+      }
+    }
+  };
+
+  const setInlineStatus = (panel, text) => {
+    const status = panel.querySelector(".gemsync-inline-status");
+    if (status) status.textContent = text;
+  };
+
+  const updateInlineControls = (panel, deck, page) => {
+    const total = Math.max(1, Number(deck?.totalPages) || 1);
+    const subjectSelect = panel.querySelector(".gemsync-inline-subject");
+    const deckSelect = panel.querySelector(".gemsync-inline-deck");
+    const pageInput = panel.querySelector(".gemsync-inline-page-input");
+    const totalText = panel.querySelector(".gemsync-inline-total-count");
+
+    if (subjectSelect && subjectSelect.dataset.value !== (deck?.subjectId || "")) {
+      subjectSelect.replaceChildren();
+      const option = document.createElement("option");
+      option.value = deck?.subjectId || "";
+      option.textContent = deck?.subjectTitle || "ChatGPT";
+      subjectSelect.append(option);
+      subjectSelect.dataset.value = deck?.subjectId || "";
+    }
+    if (deckSelect && deckSelect.dataset.value !== (deck?.id || "")) {
+      deckSelect.replaceChildren();
+      const option = document.createElement("option");
+      option.value = deck?.id || "";
+      option.textContent = deck?.title || "PDF";
+      deckSelect.append(option);
+      deckSelect.dataset.value = deck?.id || "";
+    }
+    if (pageInput) {
+      pageInput.max = String(total);
+      pageInput.value = String(page);
+    }
+    if (totalText) totalText.textContent = String(total);
+    setInlineStatus(panel, `ChatGPT -> PDF 第 ${page} 页`);
+  };
+
+  const buildInlinePages = (panel, deck) => {
+    const pages = panel.querySelector(".gemsync-inline-pages");
+    if (!pages) return;
+    const deckId = deck?.id || "";
+    const total = Math.max(1, Number(deck?.totalPages) || 1);
+    if (pages.dataset.deckId === deckId && Number(pages.dataset.total) === total) return;
+
+    pages.replaceChildren();
+    pages.dataset.deckId = deckId;
+    pages.dataset.total = String(total);
+    for (let itemPage = 1; itemPage <= total; itemPage += 1) {
+      const pageShell = document.createElement("article");
+      pageShell.className = "gemsync-inline-page";
+      pageShell.dataset.page = String(itemPage);
+
+      const label = document.createElement("div");
+      label.className = "gemsync-inline-page-label";
+      label.textContent = `第 ${itemPage} 页`;
+
+      const image = document.createElement("img");
+      image.alt = `${deck?.title || "PDF"} page ${itemPage}`;
+      image.decoding = "async";
+      image.loading = itemPage <= 3 ? "eager" : "lazy";
+      image.src = inlineScreenshotUrl(deck, itemPage);
+      image.addEventListener("error", () => {
+        image.hidden = true;
+        label.textContent = `第 ${itemPage} 页：图片不可用`;
+      });
+
+      pageShell.append(label, image);
+      pages.append(pageShell);
+    }
+  };
+
+  const scrollInlineViewerToPage = (panel, page, smooth = false) => {
+    const viewer = panel.querySelector(".gemsync-inline-viewer");
+    const target = panel.querySelector(`.gemsync-inline-page[data-page="${page}"]`);
+    if (!viewer || !target) return;
+    requestAnimationFrame(() => {
+      viewer.scrollTo({
+        top: Math.max(0, target.offsetTop - viewer.offsetTop - 8),
+        behavior: smooth ? "smooth" : "auto",
+      });
+    });
+  };
+
+  const syncInlinePageToChat = async (deck, page, action = "sync") => {
+    const payload = inlineSyncPayload(deck, page, `inline-${action}`);
+    try {
+      if (action === "bind") {
+        const result = await handleGemSyncBind(payload);
+        if (result?.ok) showToast(`Page ${page}: calibrated.`);
+        return;
+      }
+      const result = await handleGemSyncPage({ ...payload, deep: action === "deep" });
+      if (result?.ok) showToast(`Page ${page}: synced.`);
+    } catch (error) {
+      showToast(error.message);
+    }
+  };
+
+  const updateInlinePdfDock = (deck, page = 1, options = {}) => {
+    const panel = pdfDock?.querySelector(".gemsync-inline-panel");
+    if (!panel) return;
+    inlineDockDeck = deck;
+    const pageNumber = clampInlinePage(deck, page);
+    pdfDock.dataset.page = String(pageNumber);
+    configureInlinePdfState(deck);
+
+    buildInlinePages(panel, deck);
+    updateInlineControls(panel, deck, pageNumber);
+    updateInlineRail(panel, deck, pageNumber);
+    for (const pageShell of panel.querySelectorAll(".gemsync-inline-page")) {
+      pageShell.classList.toggle("active", Number(pageShell.dataset.page) === pageNumber);
+    }
+    scrollInlineViewerToPage(panel, pageNumber, options.smooth);
+    if (!options.silent) showToast(`PDF page ${pageNumber}.`);
+  };
+
+  const updateInlineCurrentPageOnly = (panel, deck, page) => {
+    if (!pdfDock) return;
+    inlineDockDeck = deck;
+    const pageNumber = clampInlinePage(deck, page);
+    if (Number(pdfDock.dataset.page) === pageNumber) return;
+    pdfDock.dataset.page = String(pageNumber);
+    configureInlinePdfState(deck);
+    updateInlineControls(panel, deck, pageNumber);
+    updateInlineRail(panel, deck, pageNumber);
+    for (const pageShell of panel.querySelectorAll(".gemsync-inline-page")) {
+      pageShell.classList.toggle("active", Number(pageShell.dataset.page) === pageNumber);
+    }
+  };
+
+  const createInlinePdfPanel = (deck, page = 1) => {
+    const panel = document.createElement("div");
+    panel.className = "gemsync-inline-panel";
+
+    const top = document.createElement("div");
+    top.className = "gemsync-inline-top";
+
+    const subjectSelect = document.createElement("select");
+    subjectSelect.className = "gemsync-inline-select gemsync-inline-subject";
+    subjectSelect.setAttribute("aria-label", "选择学科");
+
+    const deckSelect = document.createElement("select");
+    deckSelect.className = "gemsync-inline-select gemsync-inline-deck";
+    deckSelect.setAttribute("aria-label", "选择章节");
+
+    top.append(subjectSelect, deckSelect);
+
+    const actions = document.createElement("div");
+    actions.className = "gemsync-inline-actions";
+
+    const pager = document.createElement("div");
+    pager.className = "gemsync-inline-pager";
+    pager.setAttribute("aria-label", "页码控制");
+
+    const prev = document.createElement("button");
+    prev.type = "button";
+    prev.textContent = "‹";
+    prev.title = "上一页";
+
+    const pageInput = document.createElement("input");
+    pageInput.className = "gemsync-inline-page-input";
+    pageInput.type = "number";
+    pageInput.min = "1";
+    pageInput.value = String(clampInlinePage(deck, page));
+    pageInput.setAttribute("aria-label", "当前页");
+
+    const total = document.createElement("span");
+    total.className = "gemsync-inline-total";
+    total.append(" / ");
+    const totalCount = document.createElement("span");
+    totalCount.className = "gemsync-inline-total-count";
+    total.append(totalCount);
+
+    const next = document.createElement("button");
+    next.type = "button";
+    next.textContent = "›";
+    next.title = "下一页";
+
+    pager.append(prev, pageInput, total, next);
+
+    const autoLabel = document.createElement("label");
+    autoLabel.className = "gemsync-inline-switch";
+    const autoInput = document.createElement("input");
+    autoInput.className = "gemsync-inline-auto-sync";
+    autoInput.type = "checkbox";
+    autoInput.checked = true;
+    const autoText = document.createElement("span");
+    autoText.textContent = "自动同步";
+    autoLabel.append(autoInput, autoText);
+
+    const sync = document.createElement("button");
+    sync.type = "button";
+    sync.className = "gemsync-inline-primary";
+    sync.textContent = "同步本页";
+
+    const deep = document.createElement("button");
+    deep.type = "button";
+    deep.textContent = "深度同步";
+
+    const bind = document.createElement("button");
+    bind.type = "button";
+    bind.textContent = "校准本页";
+
+    const close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "×";
+    close.title = "关闭面板";
+
+    actions.append(pager, autoLabel, sync, deep, bind, close);
+
+    const status = document.createElement("div");
+    status.className = "gemsync-inline-status";
+
+    const layout = document.createElement("div");
+    layout.className = "gemsync-inline-layout";
+
+    const rail = document.createElement("nav");
+    rail.className = "gemsync-inline-rail";
+    rail.setAttribute("aria-label", "PDF pages");
+
+    const viewer = document.createElement("section");
+    viewer.className = "gemsync-inline-viewer";
+    viewer.setAttribute("aria-label", "PPT page");
+
+    const pages = document.createElement("div");
+    pages.className = "gemsync-inline-pages";
+
+    viewer.append(pages);
+    layout.append(rail, viewer);
+    panel.append(top, actions, status, layout);
+
+    const currentPage = () => clampInlinePage(inlineDockDeck || deck, Number(pdfDock?.dataset.page) || pageInput.value || page);
+    const currentPageFromViewer = () => {
+      const activeDeck = inlineDockDeck || deck;
+      const threshold = viewer.scrollTop + 42;
+      let selected = 1;
+      for (const pageShell of panel.querySelectorAll(".gemsync-inline-page")) {
+        const pageTop = Math.max(0, pageShell.offsetTop - viewer.offsetTop);
+        if (pageTop <= threshold) {
+          selected = Number(pageShell.dataset.page) || selected;
+        } else {
+          break;
+        }
+      }
+      return clampInlinePage(activeDeck, selected);
+    };
+    const go = (nextPage, smooth = true) => {
+      const activeDeck = inlineDockDeck || deck;
+      updateInlinePdfDock(activeDeck, nextPage, { smooth });
+      if (autoInput.checked) {
+        syncInlinePageToChat(activeDeck, nextPage).catch((error) => showToast(error.message));
+      }
+    };
+
+    prev.addEventListener("click", () => go(currentPage() - 1));
+    next.addEventListener("click", () => go(currentPage() + 1));
+    pageInput.addEventListener("change", () => go(Number(pageInput.value) || 1));
+    pageInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        go(Number(pageInput.value) || 1);
+      }
+    });
+    let viewerRaf = 0;
+    let viewerSyncTimer = 0;
+    viewer.addEventListener("scroll", () => {
+      cancelAnimationFrame(viewerRaf);
+      viewerRaf = requestAnimationFrame(() => {
+        const activeDeck = inlineDockDeck || deck;
+        const nextPage = currentPageFromViewer();
+        if (nextPage === currentPage()) return;
+        updateInlineCurrentPageOnly(panel, activeDeck, nextPage);
+        clearTimeout(viewerSyncTimer);
+        if (autoInput.checked) {
+          viewerSyncTimer = setTimeout(() => {
+            syncInlinePageToChat(activeDeck, nextPage, "auto").catch((error) => showToast(error.message));
+          }, 650);
+        }
+      });
+    }, { passive: true });
+    autoInput.addEventListener("change", () => {
+      configureInlinePdfState(inlineDockDeck || deck);
+      setInlineStatus(panel, autoInput.checked
+        ? `ChatGPT -> PDF 第 ${currentPage()} 页`
+        : `自动同步已关闭，第 ${currentPage()} 页`);
+    });
+    sync.addEventListener("click", () => {
+      const activeDeck = inlineDockDeck || deck;
+      syncInlinePageToChat(activeDeck, currentPage()).catch((error) => showToast(error.message));
+    });
+    deep.addEventListener("click", () => {
+      const activeDeck = inlineDockDeck || deck;
+      syncInlinePageToChat(activeDeck, currentPage(), "deep").catch((error) => showToast(error.message));
+    });
+    bind.addEventListener("click", () => {
+      const activeDeck = inlineDockDeck || deck;
+      syncInlinePageToChat(activeDeck, currentPage(), "bind").catch((error) => showToast(error.message));
+    });
+    close.addEventListener("click", closePdfDock);
+
+    setTimeout(() => updateInlinePdfDock(deck, page, { silent: true }), 0);
+    return panel;
   };
 
   const updatePdfDockDeck = (deck, page = 1) => {
@@ -1809,10 +2625,14 @@
     if (title) {
       title.textContent = deck?.title ? `PDF: ${deck.title}` : "PDF";
     }
+    if (pdfDock.dataset.mode === "inline") {
+      updateInlinePdfDock(deck, page, { silent: true });
+      return;
+    }
     if (iframe) {
       const panelUrl = pdfDockUrlFor(deck, page);
       if (!panelUrl) {
-        showToast("PDF 面板地址不可用。请刷新 Gemini，或重载 GemSync 插件。");
+        showToast("PDF 面板地址不可用。请刷新页面，或重载 DeckSync 插件。");
         return;
       }
       iframe.src = panelUrl;
@@ -1822,22 +2642,26 @@
   const openPdfDock = async (options = {}) => {
     const deck = await getGemSyncDeck(options.deckId || "", options.subjectId || "");
     const page = Math.max(1, Number(options.page) || 1);
-    const panelUrl = pdfDockUrlFor(deck, page);
+    const useInlinePanel = (deck?.provider || currentProvider()) === "chatgpt";
+    const panelUrl = useInlinePanel ? inlineScreenshotUrl(deck, page) : pdfDockUrlFor(deck, page);
     if (!panelUrl) {
-      showToast("PDF 面板地址不可用。请刷新 Gemini，或重载 GemSync 插件。");
+      showToast("PDF 面板地址不可用。请刷新页面，或重载 DeckSync 插件。");
       return;
     }
 
     if (pdfDock) {
-      updatePdfDockDeck(deck, page);
-      setPdfDockOpen(true);
-      return;
+      if ((pdfDock.dataset.mode === "inline") === useInlinePanel) {
+        updatePdfDockDeck(deck, page);
+        setPdfDockOpen(true);
+        return;
+      }
+      closePdfDock();
     }
 
     ensurePdfDockStyle();
     const dock = document.createElement("section");
     dock.id = `${HOST_ID}-pdf-dock`;
-    dock.setAttribute("aria-label", "GemSync PDF study panel");
+    dock.setAttribute("aria-label", "DeckSync PDF study panel");
 
     const bar = document.createElement("div");
     bar.className = "gemsync-dock-bar";
@@ -1859,25 +2683,38 @@
     close.textContent = "×";
     close.title = "Close PDF panel";
 
-    const iframe = document.createElement("iframe");
-    iframe.src = panelUrl;
-    iframe.title = "GemSync PDF";
-
     refresh.addEventListener("click", () => {
-      iframe.src = iframe.src;
+      if (pdfDock?.dataset.mode === "inline") {
+        updateInlinePdfDock(inlineDockDeck || deck, Number(pdfDock?.dataset.page) || page);
+        return;
+      }
+      const iframe = pdfDock?.querySelector("iframe");
+      if (iframe) iframe.src = iframe.src;
     });
     close.addEventListener("click", closePdfDock);
 
-    bar.append(title, spacer, refresh, close);
-    dock.append(bar, iframe);
+    if (useInlinePanel) {
+      dock.dataset.mode = "inline";
+      dock.dataset.page = String(clampInlinePage(deck, page));
+      dock.append(createInlinePdfPanel(deck, page));
+    } else {
+      bar.append(title, spacer, refresh, close);
+      dock.dataset.mode = "frame";
+      const iframe = document.createElement("iframe");
+      iframe.src = panelUrl;
+      iframe.title = "DeckSync PDF";
+      dock.append(bar, iframe);
+    }
     document.documentElement.append(dock);
     pdfDock = dock;
+    if (useInlinePanel) updateInlinePdfDock(deck, page, { silent: true });
     setPdfDockOpen(true);
     showToast("PDF panel opened.");
   };
 
   const rememberPendingPdfDock = (payload) => {
-    const conversationId = payload?.conversationId || geminiConversationIdFromUrl(payload?.geminiUrl || "");
+    const targetUrl = payload?.geminiUrl || payload?.chatgptUrl || "";
+    const conversationId = payload?.conversationId || geminiConversationIdFromUrl(targetUrl);
     try {
       localStorage.setItem(GEMSYNC_PENDING_DOCK_KEY, JSON.stringify({
         subjectId: payload?.subjectId || "",
@@ -1913,21 +2750,23 @@
   };
 
   const handleGemSyncOpenGemini = async (payload) => {
-    if (!payload?.geminiUrl) {
-      return { ok: false, error: "This deck has no Gemini URL." };
+    const targetUrl = payload?.geminiUrl || payload?.chatgptUrl || "";
+    const providerName = payload?.provider === "chatgpt" || payload?.chatgptUrl ? "ChatGPT" : "Gemini";
+    if (!targetUrl) {
+      return { ok: false, error: `This deck has no ${providerName} URL.` };
     }
 
     rememberPendingPdfDock(payload);
-    const targetConversationId = payload.conversationId || geminiConversationIdFromUrl(payload.geminiUrl);
+    const targetConversationId = payload.conversationId || geminiConversationIdFromUrl(targetUrl);
     if (targetConversationId && targetConversationId === getConversationId()) {
       await openPdfDock({ subjectId: payload.subjectId, deckId: payload.deckId, page: payload.pageNumber || 1 });
-      showToast("Gemini chat already open.");
+      showToast(`${providerName} chat already open.`);
       return { ok: true, alreadyOpen: true };
     }
 
-    showToast(`Opening ${payload.deckTitle || "Gemini chat"}...`);
+    showToast(`Opening ${payload.deckTitle || `${providerName} chat`}...`);
     setTimeout(() => {
-      location.assign(payload.geminiUrl);
+      location.assign(targetUrl);
     }, 80);
     return { ok: true, navigating: true };
   };
@@ -1962,6 +2801,10 @@
         ...(message.payload || {}),
         autoSyncEnabled: !!message.payload?.autoSyncEnabled,
       };
+      const title = pdfDock?.querySelector(".gemsync-dock-title");
+      if (title && message.payload?.deckTitle) {
+        title.textContent = `PDF: ${message.payload.deckTitle}`;
+      }
       if (gemSyncPdfState.autoSyncEnabled) {
         scheduleGeminiToPdfSync();
       } else {
@@ -1989,9 +2832,10 @@
     }
   };
 
-  const postGemSyncResult = async (id, result) => {
+  const postGemSyncResult = async (id, result, server = gemSyncServer) => {
     try {
-      await fetch(`${GEMSYNC_SERVER}/api/result`, {
+      if (!server) return;
+      await fetch(`${server}/api/result`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id, ...result }),
@@ -2001,7 +2845,7 @@
     }
   };
 
-  const executeGemSyncCommand = async (command) => {
+  const executeGemSyncCommand = async (command, server) => {
     if (!command?.id) return;
     try {
       let result;
@@ -2012,9 +2856,9 @@
       } else {
         result = { ok: false, error: `Unknown command: ${command.type}` };
       }
-      await postGemSyncResult(command.id, result);
+      await postGemSyncResult(command.id, result, server);
     } catch (error) {
-      await postGemSyncResult(command.id, { ok: false, error: error.message });
+      await postGemSyncResult(command.id, { ok: false, error: error.message }, server);
     }
   };
 
@@ -2023,14 +2867,16 @@
     if (gemSyncPolling) return;
     gemSyncPolling = true;
     try {
+      const server = await resolveGemSyncServer();
+      if (!server) return;
       const conversationId = encodeURIComponent(getConversationId());
-      const response = await fetch(`${GEMSYNC_SERVER}/api/command?conversationId=${conversationId}`, {
+      const response = await fetch(`${server}/api/command?conversationId=${conversationId}`, {
         cache: "no-store",
       });
       if (!response.ok) return;
       const data = await response.json();
       if (data?.command) {
-        await executeGemSyncCommand(data.command);
+        await executeGemSyncCommand(data.command, server);
       }
     } catch {
       // The local PDF sync app is optional. Stay quiet when it is closed.

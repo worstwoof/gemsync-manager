@@ -1,4 +1,4 @@
-# GemSync Chrome 插件
+# DeckSync Chrome 插件
 
 这个插件会在 Gemini 页面上加入几个悬浮学习按钮，用来打开 PDF 面板、保存阅读位置和同步聊天记录。
 
@@ -19,7 +19,7 @@ extension/pdf-panel/subjects.json
 extension/pdf-panel/subjects/
 ```
 
-这些文件由 GemSync Manager 生成，里面可能包含本地 PDF 路径和 Gemini 对话链接，所以默认不会上传到 Git。
+这些文件由 DeckSync 生成，里面可能包含本地 PDF 路径和模型对话链接，所以默认不会上传到 Git。
 
 ## 安装方法
 
@@ -31,6 +31,6 @@ extension/pdf-panel/subjects/
 
 ## 生成 PDF 面板数据
 
-先在 GemSync Manager 网页里完成课程扫描、Gemini 自动提问和截图准备。
+先在 DeckSync 网页里完成课程扫描、模型自动提问和截图准备。
 
 等 Gemini 对话准备好后，点击“写入插件”，管理器会生成 PDF 面板需要的本地配置。

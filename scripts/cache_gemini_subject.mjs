@@ -73,8 +73,7 @@ async function listFiles(dir, extensions) {
   }
 }
 
-async function screenshotDecks(workspace) {
-  const root = path.join(workspace, "gemini_ppt_screenshots_full");
+async function screenshotDecks(root) {
   try {
     const entries = await fs.readdir(root, { withFileTypes: true });
     const decks = [];
@@ -125,6 +124,7 @@ function runNode(args, cwd) {
 
 const args = readArgs();
 const workspace = path.resolve(required(args, "workspace"));
+const screenshotRoot = path.resolve(optional(args, "root", path.join(workspace, "DeckSync", "shots")));
 const extensionRoot = path.resolve(optional(args, "extension-root", path.join(repoRoot, "extension")));
 const subjectId = required(args, "subject-id");
 const chrome = optional(args, "chrome", "http://127.0.0.1:9222");
@@ -147,9 +147,9 @@ if (!config) {
 
 const pagesPerPrompt = Math.max(1, Math.min(3, Math.floor(Number(optional(args, "pages-per-prompt", config.pagesPerPrompt || 1)) || 1)));
 
-const decks = await screenshotDecks(workspace);
+const decks = await screenshotDecks(screenshotRoot);
 if (!decks.length) {
-  throw new Error(`No screenshot decks found under ${path.join(workspace, "gemini_ppt_screenshots_full")}`);
+  throw new Error(`No screenshot decks found under ${screenshotRoot}`);
 }
 
 const exporter = path.join(__dirname, "export_gemini_cached_transcript.mjs");

@@ -71,11 +71,22 @@ async function importPlaywright() {
 const { chromium } = await importPlaywright();
 
 const chromeDebugUrl = process.env.GEMINI_CHROME_DEBUG_URL || 'http://127.0.0.1:9222';
-const root = path.resolve(process.env.GEMINI_PPT_ROOT || path.join(process.cwd(), 'gemini_ppt_screenshots_full'));
+const root = path.resolve(process.env.GEMINI_PPT_ROOT || path.join(process.cwd(), 'DeckSync', 'shots'));
 const progressPath = path.resolve(process.env.GEMINI_PROGRESS_PATH || path.join(root, 'gemini_progress.json'));
 const conversationFoldersPath = path.resolve(process.env.GEMINI_CONVERSATION_FOLDERS_PATH || path.join(root, 'conversation_folders.json'));
-const promptText = process.env.GEMINI_PPT_PROMPT || '\u8bf7\u8be6\u7ec6\u8bb2\u89e3\u8fd9\u4e00\u9762PPT';
-const prePromptText = String(process.env.GEMINI_PRE_PROMPT || '').trim();
+function envUtf8(name, fallback = '') {
+  const encoded = process.env[`${name}_B64`];
+  if (encoded) {
+    try {
+      return Buffer.from(encoded, 'base64').toString('utf8');
+    } catch {
+      // Fall back to the plain environment variable.
+    }
+  }
+  return process.env[name] || fallback;
+}
+const promptText = envUtf8('GEMINI_PPT_PROMPT', '\u8bf7\u8be6\u7ec6\u8bb2\u89e3\u8fd9\u4e00\u9762PPT');
+const prePromptText = String(envUtf8('GEMINI_PRE_PROMPT', '')).trim();
 const pagesPerPrompt = Math.max(1, Math.min(3, Math.floor(Number(process.env.GEMINI_PAGES_PER_PROMPT || '1') || 1)));
 const maxSlides = Number(process.env.MAX_SLIDES || '0');
 const quotaCheckIntervalMs = Number(process.env.QUOTA_CHECK_INTERVAL_MS || '300000');
@@ -89,8 +100,70 @@ const preSendSettleMs = Number(process.env.GEMINI_PRE_SEND_SETTLE_MS || '8000');
 const firstSlidePreSendSettleMs = Number(process.env.GEMINI_FIRST_SLIDE_PRE_SEND_SETTLE_MS || '30000');
 const requestedModel = normalizeModelChoice(process.env.GEMINI_MODEL || 'pro');
 const proFallback = normalizeProFallback(process.env.GEMINI_PRO_FALLBACK || 'flash');
+const dryRun = /^(1|true|yes)$/i.test(String(process.env.DECKSYNC_AUTOMATION_DRY_RUN || process.env.GEMINI_DRY_RUN || ''));
+const autoCacheAfterDeck = /^(1|true|yes)$/i.test(String(process.env.DECKSYNC_AUTO_CACHE_AFTER_DECK || ''));
+const managerUrl = String(process.env.DECKSYNC_MANAGER_URL || '').replace(/\/+$/g, '');
+const autoCachePayload = readAutoCachePayload();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function readAutoCachePayload() {
+  const encoded = process.env.DECKSYNC_AUTO_CACHE_PAYLOAD_B64 || '';
+  if (!encoded) return null;
+  try {
+    return JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function deckIdFromFolder(deck) {
+  const number = Number(/^deck(\d+)/i.exec(String(deck || ''))?.[1] || 0);
+  return number ? `deck${String(number).padStart(2, '0')}` : String(deck || 'deck');
+}
+
+async function apiJson(pathname, options = {}) {
+  if (!managerUrl) throw new Error('DeckSync manager URL is missing.');
+  const response = await fetch(`${managerUrl}${pathname}`, {
+    headers: { 'Content-Type': 'application/json' },
+    ...options,
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || data?.ok === false) throw new Error(data?.error || `DeckSync API ${pathname} failed with ${response.status}`);
+  return data;
+}
+
+async function waitForManagerJob(jobId) {
+  while (jobId) {
+    const data = await apiJson(`/api/jobs/${encodeURIComponent(jobId)}/log`);
+    if (data.job?.status !== 'running') return data.job;
+    await sleep(2000);
+  }
+  return null;
+}
+
+async function autoCacheDeck(deck, slides) {
+  if (!autoCacheAfterDeck || !autoCachePayload || !managerUrl) return;
+  const totalSlides = Array.isArray(slides) ? slides.length : Number(slides || 0);
+  const sentSlides = Number(progress.sent?.[deck] || 0);
+  const deckId = deckIdFromFolder(deck);
+  if (!totalSlides || sentSlides < totalSlides) {
+    console.log(`AUTO_CACHE_SKIP_INCOMPLETE ${deck} sent=${sentSlides}/${totalSlides || 'unknown'}`);
+    return;
+  }
+  try {
+    console.log(`AUTO_CACHE_START ${deck} -> ${deckId}`);
+    const data = await apiJson('/api/jobs/cache', {
+      method: 'POST',
+      body: JSON.stringify({ ...autoCachePayload, provider: 'gemini', cacheDecks: [deckId] }),
+    });
+    const job = await waitForManagerJob(data.job?.id);
+    if (job?.status === 'complete') console.log(`AUTO_CACHE_DONE ${deck} -> ${deckId}`);
+    else console.log(`AUTO_CACHE_FAILED ${deck} -> ${deckId} status=${job?.status || 'unknown'}`);
+  } catch (error) {
+    console.log(`AUTO_CACHE_FAILED ${deck} -> ${deckId} message="${error instanceof Error ? error.message : String(error)}"`);
+  }
+}
 
 function normalizePromptText(value) {
   return String(value || '').replace(/\s+/g, ' ').trim();
@@ -129,14 +202,62 @@ async function readProgress() {
     if (raw.deck && raw.url) conversations[raw.deck] = raw.url;
     return { sent, conversations, updatedAt: raw.updatedAt };
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    if (error?.code !== 'ENOENT') {
+      const backup = await backupInvalidJson(progressPath);
+      console.log(`WARN invalid progress JSON backed up: ${backup}`);
+    }
     return { sent: {}, conversations: {} };
   }
 }
 
 async function writeProgress(progress) {
   progress.updatedAt = new Date().toISOString();
-  await fs.writeFile(progressPath, JSON.stringify(progress, null, 2), 'utf8');
+  await writeJsonAtomic(progressPath, progress);
+}
+
+async function writeJsonAtomic(file, value) {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await cleanupStaleJsonTemps(file);
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${Date.now()}.tmp`);
+  try {
+    await fs.writeFile(temp, JSON.stringify(value, null, 2) + '\n', 'utf8');
+    await fs.rename(temp, file);
+  } catch (error) {
+    await fs.rm(temp, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function cleanupStaleJsonTemps(file, maxAgeMs = 24 * 60 * 60 * 1000) {
+  const dir = path.dirname(file);
+  const prefix = `.${path.basename(file)}.`;
+  const cutoff = Date.now() - maxAgeMs;
+  let entries = [];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  await Promise.all(entries
+    .filter((entry) => entry.isFile() && entry.name.startsWith(prefix) && entry.name.endsWith('.tmp'))
+    .map(async (entry) => {
+      const temp = path.join(dir, entry.name);
+      try {
+        const stat = await fs.stat(temp);
+        if (stat.mtimeMs < cutoff) await fs.rm(temp, { force: true });
+      } catch {
+        // Ignore cleanup races.
+      }
+    }));
+}
+
+async function backupInvalidJson(file) {
+  const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const backupDir = path.join(root, 'archives', 'invalid-json');
+  await fs.mkdir(backupDir, { recursive: true });
+  const backup = path.join(backupDir, `${path.basename(file, '.json')}.invalid-${stamp}.json`);
+  await fs.copyFile(file, backup);
+  return backup;
 }
 
 async function readConversationFolders() {
@@ -145,9 +266,24 @@ async function readConversationFolders() {
     const data = JSON.parse(text);
     if (data && Array.isArray(data.folders)) return data;
   } catch (error) {
-    if (error?.code !== 'ENOENT') throw error;
+    if (error?.code !== 'ENOENT') {
+      const backup = await backupInvalidJson(conversationFoldersPath);
+      console.log(`WARN invalid conversation folders JSON backed up: ${backup}`);
+    }
   }
   return { version: 1, root, folders: [] };
+}
+
+function isSpecificGeminiConversationUrl(value) {
+  return /gemini\.google\.com\/app\/[^/?#]+/i.test(String(value || ''));
+}
+
+function bestConversationUrl(...candidates) {
+  const values = candidates.map((candidate) => String(candidate || '').trim()).filter(Boolean);
+  return values.find(isSpecificGeminiConversationUrl)
+    || values.find((value) => /gemini\.google\.com\/app/i.test(value))
+    || values[0]
+    || '';
 }
 
 async function updateConversationFolderIndex(progress, deck, slides, conversationUrl) {
@@ -157,16 +293,22 @@ async function updateConversationFolderIndex(progress, deck, slides, conversatio
   const totalSlides = slides.length;
   const index = data.folders.findIndex((entry) => entry.deck === deck);
   const prior = index >= 0 ? data.folders[index] : {};
+  const url = bestConversationUrl(
+    conversationUrl,
+    progress.conversations?.[deck],
+    progress.last?.deck === deck ? progress.last.url : '',
+    prior.conversationUrl,
+  );
   const entry = {
     ...prior,
     deck,
     folder: deck,
     folderPath: path.join(root, deck),
     title: deckTitle(deck),
-    conversationUrl: conversationUrl || progress.conversations?.[deck] || prior.conversationUrl || '',
+    conversationUrl: url,
     sent,
     totalSlides,
-    status: sent >= totalSlides ? 'complete' : (conversationUrl || progress.conversations?.[deck] ? 'in_progress' : 'pending'),
+    status: sent >= totalSlides ? 'complete' : (url ? 'in_progress' : 'pending'),
     createdAt: prior.createdAt || now,
     updatedAt: now,
   };
@@ -175,7 +317,7 @@ async function updateConversationFolderIndex(progress, deck, slides, conversatio
   data.root = root;
   data.updatedAt = now;
   data.folders.sort((a, b) => a.deck.localeCompare(b.deck));
-  await fs.writeFile(conversationFoldersPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
+  await writeJsonAtomic(conversationFoldersPath, data);
 }
 
 async function listDecks() {
@@ -1756,6 +1898,17 @@ progress.modelSettings = {
 await writeProgress(progress);
 console.log(`MODEL_SETTINGS requested=${requestedModel} pro_fallback=${proFallback} pages_per_prompt=${pagesPerPrompt} prompt="${promptText}" pre_prompt_len=${prePromptText.length}`);
 const decks = await listDecks();
+if (dryRun) {
+  let totalSlides = 0;
+  for (const deck of decks) {
+    const slides = await listSlides(deck);
+    totalSlides += slides.length;
+    await updateConversationFolderIndex(progress, deck, slides, progress.conversations?.[deck] || '');
+    console.log(`DRY_RUN deck=${deck} slides=${slides.length} sent=${progress.sent?.[deck] || 0}`);
+  }
+  console.log(`DRY_RUN complete provider=gemini decks=${decks.length} slides=${totalSlides} root="${root}"`);
+  process.exit(0);
+}
 const { browser, page } = await getGeminiPage();
 
 let processed = 0;
@@ -1781,20 +1934,24 @@ try {
     }
     if (sent >= slides.length) {
       console.log(`SKIP complete ${deck} (${sent}/${slides.length})`);
-      if (progress.conversations[deck] && !isConversationRenameVerified(progress, deck)) {
-        await gotoGemini(page, progress.conversations[deck], `rename_complete_${deck}`);
+      const currentUrl = bestConversationUrl(progress.conversations[deck], progress.last?.deck === deck ? progress.last.url : '');
+      if (currentUrl) progress.conversations[deck] = currentUrl;
+      if (currentUrl && !isConversationRenameVerified(progress, deck)) {
+        await gotoGemini(page, currentUrl, `rename_complete_${deck}`);
         await waitForInput(page);
         await ensureConversationRenamed(page, deck, progress, 'complete_deck_verify');
       }
-      await updateConversationFolderIndex(progress, deck, slides, progress.conversations[deck]);
+      await updateConversationFolderIndex(progress, deck, slides, currentUrl);
       continue;
     }
 
     if (progress.conversations[deck]) {
       console.log(`RESUME ${deck} at slide ${sent + 1}/${slides.length}`);
-      await gotoGemini(page, progress.conversations[deck], `resume_${deck}`);
+      const currentUrl = bestConversationUrl(progress.conversations[deck], progress.last?.deck === deck ? progress.last.url : '');
+      progress.conversations[deck] = currentUrl;
+      await gotoGemini(page, currentUrl, `resume_${deck}`);
       await waitForInput(page);
-      await updateConversationFolderIndex(progress, deck, slides, progress.conversations[deck]);
+      await updateConversationFolderIndex(progress, deck, slides, currentUrl);
     } else {
       console.log(`NEW_CHAT ${deck}`);
       await openNewChat(page);
@@ -1839,10 +1996,13 @@ try {
         if (lastStart === slideNumber && lastEnd === endSlideNumber) {
           const answerAudit = await inspectLatestAnswer(page, buildPrompt(deck, slideNumber, slides.length, endSlideNumber));
           if (answerAudit.hasAnswer && answerAudit.hasUserImage && !answerAudit.missingImage && Number(answerAudit.userImageCount || 0) >= slideBatch.length) {
-            progress.last = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, done: true, url: page.url() };
+            const currentUrl = bestConversationUrl(page.url(), progress.conversations[deck], progress.last?.url);
+            progress.conversations[deck] = currentUrl;
+            progress.last = { deck, slide: endSlideNumber, slideStart: slideNumber, slideEnd: endSlideNumber, totalSlides: slides.length, done: true, url: currentUrl };
             progress.sent[deck] = endSlideNumber;
             await alignLatestUserTurnAtTop(page, deck, slideNumber);
             await writeProgress(progress);
+            await updateConversationFolderIndex(progress, deck, slides, currentUrl);
             console.log(`RECOVER answered ${deck} slides ${rangeLabel}/${slides.length}`);
             index = endSlideNumber;
             continue;
@@ -1916,6 +2076,7 @@ try {
       }
       index = endSlideNumber;
     }
+    await autoCacheDeck(deck, slides);
   }
   console.log('ALL_DONE');
 } finally {

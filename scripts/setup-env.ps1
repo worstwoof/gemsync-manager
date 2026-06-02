@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = Split-Path -Parent $ScriptDir
-$LocalEnvPath = Join-Path $Root '.gemsync.local.ps1'
+$LocalEnvPath = Join-Path $Root '.decksync.local.ps1'
 $Missing = New-Object System.Collections.Generic.List[string]
 $Results = [ordered]@{}
 
@@ -22,7 +22,7 @@ if ($CheckOnly) {
 
 function Write-Info {
   param([string]$Message)
-  Write-Host "[GemSync] $Message" -ForegroundColor Cyan
+  Write-Host "[DeckSync] $Message" -ForegroundColor Cyan
 }
 
 function Write-Ok {
@@ -310,7 +310,7 @@ function Resolve-PowerPoint {
   return $null
 }
 
-Write-Info "Checking GemSync Manager environment..."
+Write-Info "Checking DeckSync environment..."
 Refresh-Path
 
 $nodeCommon = @()
@@ -325,7 +325,7 @@ if (-not $node) {
 }
 if ($node) {
   if ((Get-MajorVersion $node.Version) -lt 20) {
-    Write-WarnLine "Node.js $($node.Version) found, but GemSync needs Node.js 20 or newer."
+    Write-WarnLine "Node.js $($node.Version) found, but DeckSync needs Node.js 20 or newer."
     Install-WingetPackage -Name 'Node.js LTS' -PackageId 'OpenJS.NodeJS.LTS'
     $node = Resolve-Node -CommonPaths $nodeCommon
   }
@@ -488,4 +488,4 @@ if ($Missing.Count -gt 0) {
 }
 
 Write-Host ''
-Write-Ok "GemSync environment is ready. Start with: .\start.ps1"
+Write-Ok "DeckSync environment is ready. Start with: .\start.ps1"

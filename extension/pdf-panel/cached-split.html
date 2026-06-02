@@ -3,13 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GemSync Cached Gemini</title>
+    <title>DeckSync Cache</title>
     <link rel="stylesheet" href="./vendor/katex/katex.min.css" />
     <link rel="stylesheet" href="./cached-split.css?v=interactive-cache-2" />
   </head>
   <body>
     <main class="split-shell">
-      <section class="gemini-pane" aria-label="本地 Gemini 全记录">
+      <section class="gemini-pane" aria-label="本地 AI 全记录">
         <div class="top-loader" aria-hidden="true"></div>
 
         <aside class="gemini-sidebar" aria-label="记录侧栏">
@@ -28,12 +28,12 @@
         <section class="chat-pane">
           <header class="chat-head">
             <div class="brand-lockup">
-              <h1 id="chatTitle">Gemini 全记录缓存</h1>
-              <span>Gemini 原始对话缓存 · 不总结，不改写</span>
+              <h1 id="chatTitle">AI 全记录缓存</h1>
+              <span>原始对话缓存 · 不总结，不改写</span>
             </div>
             <div class="chat-actions">
               <span id="recordCount" class="record-count">0 条记录</span>
-              <button id="openLiveGemini" type="button">打开原 Gemini</button>
+              <button id="openLiveGemini" type="button">打开原对话</button>
             </div>
           </header>
 

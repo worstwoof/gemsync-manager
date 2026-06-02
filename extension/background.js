@@ -4,15 +4,39 @@ const GEMSYNC_TYPES = new Set([
   "gemsync:open-gemini",
 ]);
 
-const findGeminiTab = async ({ conversationId, geminiUrl }) => {
-  const tabs = await chrome.tabs.query({ url: "https://gemini.google.com/*" });
+const conversationIdFromUrl = (value) => {
+  try {
+    const url = new URL(value);
+    if (/(^|\.)gemini\.google\.com$/i.test(url.hostname)) {
+      return url.pathname.match(/^\/app\/([^/?#]+)/)?.[1] || "";
+    }
+    if (/(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/i.test(url.hostname)) {
+      return url.pathname.match(/^\/c\/([^/?#]+)/)?.[1] || "";
+    }
+    return "";
+  } catch {
+    return "";
+  }
+};
+
+const providerHomeUrl = (provider) => provider === "chatgpt" ? "https://chatgpt.com/" : "https://gemini.google.com/app";
+
+const providerTabPatterns = (provider) => provider === "chatgpt"
+  ? ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+  : ["https://gemini.google.com/*"];
+
+const findModelTab = async ({ conversationId, geminiUrl, chatgptUrl, provider }) => {
+  const targetUrl = chatgptUrl || geminiUrl || "";
+  const targetProvider = provider === "chatgpt" || chatgptUrl ? "chatgpt" : "gemini";
+  const tabs = (await Promise.all(providerTabPatterns(targetProvider).map((url) => chrome.tabs.query({ url })))).flat();
+  const targetConversationId = conversationId || conversationIdFromUrl(targetUrl);
   if (conversationId) {
-    const exact = tabs.find((tab) => tab.url && tab.url.includes(`/app/${conversationId}`));
+    const exact = tabs.find((tab) => tab.url && conversationIdFromUrl(tab.url) === targetConversationId);
     if (exact) return exact;
   }
 
-  if (geminiUrl) {
-    const target = new URL(geminiUrl);
+  if (targetUrl) {
+    const target = new URL(targetUrl);
     const exact = tabs.find((tab) => {
       if (!tab.url) return false;
       try {
@@ -51,28 +75,31 @@ const activateTab = async (tab) => {
 
 const handleGemSync = async (message) => {
   const payload = message.payload || {};
-  const tab = await findGeminiTab(payload);
+  const provider = payload.provider === "chatgpt" || payload.chatgptUrl ? "chatgpt" : "gemini";
+  const targetUrl = payload.chatgptUrl || payload.geminiUrl || providerHomeUrl(provider);
+  const targetConversationId = payload.conversationId || conversationIdFromUrl(targetUrl);
+  const tab = await findModelTab({ ...payload, provider, conversationId: targetConversationId });
 
   if (message.type === "gemsync:open-gemini") {
     if (tab?.id) {
       await activateTab(tab);
-      if (payload.geminiUrl && tab.url && !tab.url.includes(`/app/${payload.conversationId}`)) {
-        await chrome.tabs.update(tab.id, { url: payload.geminiUrl, active: true });
+      if (targetUrl && tab.url && conversationIdFromUrl(tab.url) !== targetConversationId) {
+        await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
         return { ok: true, needLoad: true };
       }
       return { ok: true };
     }
-    await chrome.tabs.create({ url: payload.geminiUrl || "https://gemini.google.com/app" });
+    await chrome.tabs.create({ url: targetUrl });
     return { ok: true, needLoad: true };
   }
 
   if (!tab?.id) {
-    await chrome.tabs.create({ url: payload.geminiUrl || "https://gemini.google.com/app" });
+    await chrome.tabs.create({ url: targetUrl });
     return { ok: true, needLoad: true };
   }
 
-  if (payload.geminiUrl && payload.conversationId && tab.url && !tab.url.includes(`/app/${payload.conversationId}`)) {
-    await chrome.tabs.update(tab.id, { url: payload.geminiUrl, active: true });
+  if (targetUrl && targetConversationId && tab.url && conversationIdFromUrl(tab.url) !== targetConversationId) {
+    await chrome.tabs.update(tab.id, { url: targetUrl, active: true });
     return { ok: true, needLoad: true };
   }
 
