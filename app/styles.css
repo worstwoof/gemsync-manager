@@ -154,6 +154,10 @@ label span {
   font-size: 12px;
 }
 
+.is-hidden {
+  display: none !important;
+}
+
 .topbar {
   position: sticky;
   top: 0;
@@ -267,10 +271,12 @@ label span {
 
 .setup {
   grid-area: setup;
+  overflow: hidden;
 }
 
 .workflow {
   grid-area: workflow;
+  align-self: stretch;
   animation-delay: 50ms;
 }
 
@@ -280,7 +286,10 @@ label span {
 }
 
 .jobs {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   grid-area: jobs;
+  align-self: stretch;
   animation-delay: 130ms;
 }
 
@@ -298,12 +307,23 @@ label span {
   padding: 17px;
 }
 
+.setup {
+  padding: 0;
+}
+
 .panel-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
   margin-bottom: 14px;
+}
+
+.setup .panel-head {
+  margin: 0;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid rgba(219, 232, 230, 0.82);
+  background: #fbfefd;
 }
 
 .panel-head h1,
@@ -333,6 +353,14 @@ label span {
   gap: 12px;
 }
 
+.setup .field-stack {
+  margin: 16px 18px 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfefe;
+  padding: 14px;
+}
+
 .path-picker {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 74px;
@@ -350,14 +378,96 @@ label span {
   font-size: 12px;
 }
 
+.setup .hint-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 18px 0;
+  background: #f3fbf8;
+}
+
+.setup .hint-box button {
+  flex: 0 0 auto;
+}
+
+.parallel-guide {
+  display: grid;
+  gap: 10px;
+  margin: 12px 18px 0;
+  border: 1px solid #cfdedb;
+  border-radius: var(--radius);
+  background: #ffffff;
+  padding: 12px;
+}
+
+.parallel-guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.parallel-guide-head strong {
+  font-size: 15px;
+}
+
+.parallel-guide-head span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.parallel-guide-head button {
+  min-height: 34px;
+  padding-inline: 12px;
+}
+
+.parallel-guide-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+.parallel-guide-grid > div {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-height: 82px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #f8fcfb;
+  padding: 10px;
+}
+
+.parallel-guide-grid strong {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.parallel-guide-grid span {
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.parallel-guide p {
+  margin: 0;
+  border-top: 1px solid var(--line);
+  color: #4d6f68;
+  font-size: 12px;
+  padding-top: 9px;
+}
+
 .settings-box {
   display: grid;
   gap: 12px;
-  margin-top: 14px;
-  border: 1px solid #d6e8e5;
+  margin: 12px 18px 18px;
+  border: 1px solid #cfdedb;
   border-radius: var(--radius);
-  background: #fbfefe;
-  padding: 12px;
+  background: #ffffff;
+  padding: 14px;
 }
 
 .settings-head {
@@ -368,7 +478,7 @@ label span {
 }
 
 .settings-head strong {
-  font-size: 14px;
+  font-size: 15px;
 }
 
 .settings-head span {
@@ -379,7 +489,42 @@ label span {
 .settings-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 12px;
+}
+
+.toggle-field {
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  min-height: 64px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #fbfefd;
+  padding: 10px 12px;
+}
+
+.toggle-field input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  padding: 0;
+}
+
+.toggle-field span {
+  display: grid;
+  gap: 3px;
+}
+
+.toggle-field strong {
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.toggle-field small {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .workflow-hint {
@@ -418,7 +563,7 @@ label span {
 .step-item {
   position: relative;
   display: grid;
-  grid-template-columns: 34px minmax(0, 1fr) 122px;
+  grid-template-columns: 34px minmax(0, 1fr) 156px;
   align-items: center;
   gap: 12px;
   min-height: 78px;
@@ -558,7 +703,8 @@ label span {
 }
 
 .step-item button {
-  width: 122px;
+  width: 156px;
+  padding-inline: 10px;
 }
 
 .step-actions {
@@ -568,16 +714,49 @@ label span {
 }
 
 .step-actions button {
-  width: 122px;
+  width: 156px;
+  padding-inline: 10px;
 }
 
 .cache-deck-list {
   display: grid;
   gap: 7px;
   margin-top: 10px;
+  max-height: 340px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
-.cache-deck-option {
+.screenshot-file-list {
+  display: grid;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.screenshot-file-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.screenshot-file-head strong {
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.screenshot-file-options {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.cache-deck-option,
+.screenshot-file-option {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;
   align-items: center;
@@ -588,39 +767,47 @@ label span {
   padding: 8px 9px;
 }
 
-.cache-deck-option.is-disabled {
+.cache-deck-option.is-disabled,
+.screenshot-file-option.is-muted {
   opacity: 0.62;
 }
 
-.cache-deck-option input {
+.cache-deck-option input,
+.screenshot-file-option input {
   width: 16px;
   height: 16px;
   padding: 0;
 }
 
-.cache-deck-option span {
+.cache-deck-option span,
+.screenshot-file-option span {
   min-width: 0;
 }
 
 .cache-deck-option strong,
-.cache-deck-option small {
+.cache-deck-option small,
+.screenshot-file-option strong,
+.screenshot-file-option small {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.cache-deck-option strong {
+.cache-deck-option strong,
+.screenshot-file-option strong {
   color: var(--ink);
   font-size: 12px;
 }
 
-.cache-deck-option small {
+.cache-deck-option small,
+.screenshot-file-option small {
   color: var(--muted);
   font-size: 11px;
 }
 
-.cache-deck-option em {
+.cache-deck-option em,
+.screenshot-file-option em {
   border-radius: 999px;
   background: #e8f0f2;
   color: #50636d;
@@ -636,7 +823,8 @@ label span {
   color: #28744d;
 }
 
-.cache-deck-empty {
+.cache-deck-empty,
+.screenshot-file-empty {
   margin: 0;
   border: 1px dashed var(--line-strong);
   border-radius: var(--radius);
@@ -967,10 +1155,6 @@ button.quiet:hover {
     grid-template-columns: repeat(2, minmax(120px, 1fr));
   }
 
-  .settings-grid {
-    grid-template-columns: 1fr;
-  }
-
   .step-list::before {
     display: none;
   }
@@ -1008,6 +1192,21 @@ button.quiet:hover {
   }
 
   .cards {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .setup .hint-box,
+  .parallel-guide-head,
+  .settings-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .parallel-guide-grid {
     grid-template-columns: 1fr;
   }
 }

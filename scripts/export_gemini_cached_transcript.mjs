@@ -11,6 +11,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
 const execFileAsync = promisify(execFile);
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function readArgs() {
   const out = new Map();
   for (let i = 2; i < process.argv.length; i += 1) {
@@ -137,7 +146,7 @@ async function cacheRemoteAsset(url, vendorDir, assetCache) {
   try {
     const response = await fetch(url, {
       headers: {
-        "user-agent": "Mozilla/5.0 GemSyncManager/1.0",
+        "user-agent": "Mozilla/5.0 DeckSync/1.0",
       },
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -549,6 +558,21 @@ function buildExtractionFunction() {
       };
     }
 
+    function extractImmersiveEntries(container) {
+      return Array.from(container.querySelectorAll("immersive-entry-chip"))
+        .map((chip) => {
+          const title =
+            normalizeText(chip.querySelector(".card-title")?.textContent || "") ||
+            normalizeText((chip.innerText || chip.textContent || "").replace(/\bOpen\b/gi, ""));
+          const label = normalizeText(chip.innerText || chip.textContent || "");
+          return {
+            title,
+            label,
+          };
+        })
+        .filter((entry) => entry.title || entry.label);
+    }
+
     function extractUser(container) {
       const user =
         container.querySelector("user-query-content") ||
@@ -588,6 +612,7 @@ function buildExtractionFunction() {
         const assistant = extractAssistant(container);
         const assistantText = assistant.text;
         if (!user.text && !assistantText) return null;
+        const immersiveEntries = extractImmersiveEntries(container);
 
         let page = null;
         let pageStart = null;
@@ -611,6 +636,7 @@ function buildExtractionFunction() {
           userText: user.text || prompt,
           assistantText,
           assistantHtml: assistant.html,
+          ...(immersiveEntries.length ? { immersiveEntries } : {}),
           hasUserImage: Boolean(user.hasImage),
           missingImage: !user.hasImage,
           consumesSlide: Boolean(user.hasImage),
@@ -625,6 +651,8 @@ function buildExtractionFunction() {
           record.pageStart = pageStart;
           record.pageEnd = pageEnd;
           record.pages = Array.from({ length: Math.max(0, pageEnd - pageStart + 1) }, (_value, offset) => pageStart + offset);
+          record.pageSource = "sequence_provisional";
+          record.mappingVerified = false;
         } else if (expectedPage) {
           record.expectedPage = expectedPage;
         }
@@ -1086,10 +1114,18 @@ function applyExpectedPages(records, totalPages) {
     const nextPage = records
       .slice(index + 1)
       .find((item) => item.hasUserImage === true && item.missingImage !== true && Number(item.page))?.page;
-    record.hasUserImage = false;
+    const unmatchedUserImage = record.unmatchedUserImage === true || record.pageSource === "image_unmatched";
+    const fallbackExpectedPage = Math.min(pageLimit, Math.max(1, Number(nextPage || previousPage + 1 || 1)));
+    const preservedExpectedPage = Math.max(
+      0,
+      Number(record.expectedPage || record.provisionalPage || record.imageMatchCandidate?.page || 0) || 0,
+    );
+    record.hasUserImage = unmatchedUserImage;
     record.missingImage = true;
     record.consumesSlide = false;
-    record.expectedPage = Math.min(pageLimit, Math.max(1, Number(nextPage || previousPage + 1 || 1)));
+    record.expectedPage = unmatchedUserImage && preservedExpectedPage
+      ? Math.min(pageLimit, preservedExpectedPage)
+      : fallbackExpectedPage;
     delete record.page;
     delete record.pageStart;
     delete record.pageEnd;
@@ -1105,7 +1141,7 @@ function applyExpectedPages(records, totalPages) {
 function inferPageFromText(record, deckId, totalPages) {
   const pageLimit = Math.max(1, Number(totalPages) || 1);
   const escapedDeckId = String(deckId || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const text = `${record.assistantText || ""}\n${record.assistantHtml || ""}\n${record.imageName || ""}`;
+  const text = `${record.assistantText || ""}\n${record.assistantHtml || ""}`;
   const patterns = [
     new RegExp(`${escapedDeckId}_slide0*(\\d{1,4})\\.png`, "i"),
     /deck\d+_slide0*(\d{1,4})\.png/i,
@@ -1130,9 +1166,14 @@ function setRecordPage(record, deckId, page, source) {
   record.imageName = slideFileName(deckId, page);
   record.slideImageUrl = `../screenshots/${deckId}/${record.imageName}`;
   record.slideImageUrls = record.pages.map((item) => `../screenshots/${deckId}/${slideFileName(deckId, item)}`);
+  record.hasUserImage = true;
+  record.missingImage = false;
   record.consumesSlide = true;
   record.consumesSlides = record.pages.length;
   record.pageSource = source;
+  record.mappingVerified = source !== "sequence_provisional" && source !== "sequence_fallback";
+  delete record.unmatchedUserImage;
+  delete record.imageMatchCandidate;
   delete record.expectedPage;
 }
 
@@ -1148,9 +1189,57 @@ function applyTextPageHints(records, deckId, totalPages) {
   return applied;
 }
 
+function clearRecordPageMapping(record) {
+  delete record.page;
+  delete record.pageStart;
+  delete record.pageEnd;
+  delete record.pages;
+  delete record.imageName;
+  delete record.slideImageUrl;
+  delete record.slideImageUrls;
+  delete record.imageUrl;
+  delete record.thumbnailUrl;
+  record.consumesSlide = false;
+  record.consumesSlides = 0;
+}
+
+function markUnmatchedImageRecord(record, totalPages, match = null) {
+  const pageLimit = Math.max(1, Number(totalPages) || 1);
+  const provisionalPage = Number(record.pageStart || record.page || record.expectedPage || 0) || 0;
+  const candidatePage = Number(match?.page || 0) || 0;
+  const candidateScore = Number(match?.score);
+  if (provisionalPage) record.provisionalPage = Math.max(1, Math.min(pageLimit, provisionalPage));
+  clearRecordPageMapping(record);
+  record.hasUserImage = true;
+  record.missingImage = true;
+  record.unmatchedUserImage = true;
+  record.pageSource = "image_unmatched";
+  record.mappingVerified = false;
+  record.expectedPage = Math.max(
+    1,
+    Math.min(
+      pageLimit,
+      candidatePage && Number.isFinite(candidateScore) && candidateScore <= 0.012
+        ? candidatePage
+        : provisionalPage || candidatePage || 1,
+    ),
+  );
+  if (match) {
+    record.imageMatchCandidate = {
+      page: Number(match.page || 0) || null,
+      imageName: match.imageName || "",
+      score: Number.isFinite(Number(match.score)) ? Number(Number(match.score).toFixed(6)) : null,
+      secondScore: Number.isFinite(Number(match.secondScore)) ? Number(Number(match.secondScore).toFixed(6)) : null,
+      margin: Number.isFinite(Number(match.margin)) ? Number(Number(match.margin).toFixed(6)) : null,
+      error: match.error || "",
+    };
+  }
+}
+
 function slideRecordScore(record) {
   const interactive = Array.isArray(record.interactiveViews) ? record.interactiveViews.length : 0;
   return (record.pageSource === "assistant_filename" ? 100000 : 0)
+    + (record.pageSource === "image_match" ? 90000 : 0)
     + (interactive ? 5000 + interactive * 100 : 0)
     + Math.min(4000, String(record.assistantText || "").length)
     + Number(record.turn || 0) / 1000;
@@ -1181,15 +1270,21 @@ function dedupeSlideRecords(records, totalPages) {
     }
   }
 
-  let removed = 0;
-  for (let index = records.length - 1; index >= 0; index -= 1) {
-    if (!duplicateRecords.has(records[index])) continue;
-    records.splice(index, 1);
-    removed += 1;
+  let marked = 0;
+  for (const record of duplicateRecords) {
+    const pages = Array.isArray(record.pages) && record.pages.length
+      ? record.pages.map((item) => Number(item)).filter((item) => item >= 1 && item <= pageLimit)
+      : [Number(record.page || 0)].filter((item) => item >= 1 && item <= pageLimit);
+    record.duplicateSlideRecord = true;
+    record.mappingVerified = false;
+    record.pageSource = record.pageSource === "image_match" ? "duplicate_image_match" : record.pageSource;
+    record.expectedPage = pages[0] || Number(record.expectedPage || 0) || null;
+    marked += 1;
   }
 
   return {
-    removed,
+    removed: 0,
+    marked,
     mappedPages: bestByPage.size,
     missingPages: Array.from({ length: pageLimit }, (_value, index) => index + 1)
       .filter((page) => !bestByPage.has(page)),
@@ -1210,7 +1305,7 @@ async function matchUploadedImagesToSlides({ context, records, screenshotsDir, d
     return { matched: 0, attempted: imageRecords.length, unavailable: true };
   }
 
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gemsync-match-"));
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "decksync-match-"));
   try {
     const remoteDir = path.join(tmpDir, "remote");
     await fs.mkdir(remoteDir, { recursive: true });
@@ -1263,16 +1358,25 @@ async function matchUploadedImagesToSlides({ context, records, screenshotsDir, d
     const matches = JSON.parse(stdout || "[]");
     const byTurn = new Map(matches.map((item) => [Number(item.turn), item]));
     let matched = 0;
+    let skippedPageHints = 0;
+    let unmatched = 0;
 
     for (const record of imageRecords) {
-      if (record.pageSource === "assistant_filename") continue;
+      if (record.pageSource === "assistant_filename") {
+        skippedPageHints += 1;
+        continue;
+      }
       const match = byTurn.get(Number(record.turn));
       const confident = match
         && Number(match.page) > 0
         && Number(match.page) <= Number(totalPages)
         && Number(match.score) <= 0.012
         && Number(match.margin) >= 0.008;
-      if (!confident) continue;
+      if (!confident) {
+        markUnmatchedImageRecord(record, totalPages, match);
+        unmatched += 1;
+        continue;
+      }
       record.page = Number(match.page);
       const count = Math.max(1, Number(record.consumesSlides || record.remoteImageCount || 1));
       record.pageStart = record.page;
@@ -1281,12 +1385,30 @@ async function matchUploadedImagesToSlides({ context, records, screenshotsDir, d
       record.imageName = match.imageName || slideFileName(deckId, record.page);
       record.slideImageUrl = `../screenshots/${deckId}/${record.imageName}`;
       record.slideImageUrls = record.pages.map((item) => `../screenshots/${deckId}/${slideFileName(deckId, item)}`);
+      record.hasUserImage = true;
+      record.missingImage = false;
+      record.consumesSlide = true;
+      record.consumesSlides = record.pages.length;
+      record.pageSource = "image_match";
+      record.mappingVerified = true;
       record.matchScore = Number(match.score.toFixed(6));
+      record.matchSecondScore = Number(match.secondScore.toFixed(6));
+      record.matchMargin = Number(match.margin.toFixed(6));
+      delete record.expectedPage;
+      delete record.unmatchedUserImage;
+      delete record.imageMatchCandidate;
       matched += 1;
     }
 
     applyExpectedPages(records, totalPages);
-    return { matched, attempted: imageRecords.length, unavailable: false };
+    return {
+      matched,
+      attempted: imageRecords.length,
+      unmatched,
+      skippedPageHints,
+      unavailable: false,
+      thresholds: { maxScore: 0.012, minMargin: 0.008 },
+    };
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
   }
@@ -1333,6 +1455,245 @@ async function hydrateInteractiveViewsFromFiles({ records, deckId, subjectDir })
     console.log(`INTERACTIVE_RESTORED turn=${turn} title=${JSON.stringify(title)} file=${file}`);
   }
   return restored;
+}
+
+async function exportImmersiveDocuments({ page, records }) {
+  const liveEntries = await page.evaluate(() => {
+    function normalizeText(value) {
+      return String(value || "")
+        .replace(/\u00a0/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    const containers = Array.from(
+      document.querySelectorAll(".conversation-container.message-actions-hover-boundary, .conversation-container"),
+    );
+    return Array.from(document.querySelectorAll("immersive-entry-chip"))
+      .map((chip, chipIndex) => {
+        const container = chip.closest(
+          ".conversation-container.message-actions-hover-boundary, .conversation-container",
+        );
+        const rawLabel = normalizeText(chip.innerText || chip.textContent || "");
+        const title =
+          normalizeText(chip.querySelector(".card-title")?.textContent || "") ||
+          rawLabel.replace(/\bOpen\b/gi, "").replace(/\d+月\d+日\s+\d+:\d+\s*$/u, "").trim();
+        return {
+          chipIndex,
+          title,
+          label: rawLabel,
+          containerId: container?.id || "",
+          containerIndex: containers.indexOf(container),
+        };
+      })
+      .filter((entry) => entry.containerId && (entry.title || entry.label));
+  });
+
+  const targetById = new Map();
+  for (const record of records) {
+    if (!record.conversationTurnId && !Number.isInteger(Number(record.containerIndex))) continue;
+    if (!Array.isArray(record.immersiveEntries) || !record.immersiveEntries.length) continue;
+    targetById.set(record.conversationTurnId || `index:${record.containerIndex}`, {
+      record,
+      entry: record.immersiveEntries[0] || {},
+      containerId: record.conversationTurnId || "",
+      containerIndex: record.containerIndex,
+    });
+  }
+
+  for (const entry of liveEntries) {
+    const record =
+      records.find((item) => item.conversationTurnId && item.conversationTurnId === entry.containerId) ||
+      records.find((item) => Number(item.containerIndex) === Number(entry.containerIndex));
+    if (!record) continue;
+    targetById.set(entry.containerId || `index:${entry.containerIndex}`, {
+      record,
+      entry,
+      containerId: entry.containerId,
+      containerIndex: entry.containerIndex,
+    });
+  }
+
+  const targets = [...targetById.values()];
+  if (!targets.length) return [];
+
+  const exported = [];
+  for (const target of targets) {
+    const { record, entry } = target;
+    const opened = await page.evaluate(({ containerId, containerIndex }) => {
+      const containers = Array.from(
+        document.querySelectorAll(".conversation-container.message-actions-hover-boundary, .conversation-container"),
+      );
+      const container = containerId
+        ? containers.find((item) => item.id === containerId)
+        : containers[Number(containerIndex) || 0];
+      const chip = container?.querySelector("immersive-entry-chip");
+      const button = chip?.querySelector("button, gem-button");
+      if (!button) return { ok: false, reason: "missing_button" };
+      button.scrollIntoView({ block: "center", inline: "nearest" });
+      button.click();
+      return {
+        ok: true,
+      label: (chip.innerText || chip.textContent || "").trim(),
+      };
+    }, {
+      containerId: target.containerId || record.conversationTurnId || "",
+      containerIndex: target.containerIndex ?? record.containerIndex,
+    });
+
+    if (!opened.ok) {
+      console.warn(`IMMERSIVE_SKIP turn=${record.turn} reason=${opened.reason || "open_failed"}`);
+      continue;
+    }
+
+    await page.waitForFunction(
+      () => {
+        const editor =
+          document.querySelector("#extended-response-markdown-content") ||
+          document.querySelector("#extended-response-message-content .ProseMirror") ||
+          document.querySelector("immersive-editor .ProseMirror") ||
+          document.querySelector("extended-response-panel .ProseMirror");
+        return Boolean((editor?.innerText || editor?.textContent || "").trim().length > 80);
+      },
+      null,
+      { timeout: 15000 },
+    ).catch(() => null);
+    await page.waitForTimeout(600);
+
+    const documentData = await page.evaluate(() => {
+      function normalizeText(value) {
+        return String(value || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/[ \t]+\n/g, "\n")
+          .replace(/\n[ \t]+/g, "\n")
+          .replace(/[ \t]{2,}/g, " ")
+          .replace(/\n{3,}/g, "\n\n")
+          .trim();
+      }
+
+      function escapeHtml(value) {
+        return String(value || "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function escapeHtmlAttribute(value) {
+        return escapeHtml(value).replaceAll("\n", "&#10;");
+      }
+
+      function serializeChildren(element) {
+        return Array.from(element.childNodes).map(serializeNode).join("");
+      }
+
+      function serializeNode(node) {
+        if (node.nodeType === Node.TEXT_NODE) return escapeHtml(node.textContent || "").replace(/\n/g, "<br>");
+        if (node.nodeType !== Node.ELEMENT_NODE) return "";
+        const element = node;
+        const tag = element.tagName.toLowerCase();
+        if (["button", "mat-icon", "style", "script"].includes(tag)) return "";
+
+        const math = element.getAttribute("data-math");
+        if (math) {
+          const mathTag = element.classList.contains("math-block") ? "div" : "span";
+          const cls = mathTag === "div" ? "math-display" : "math-inline";
+          return `<${mathTag} class="${cls}" data-math="${escapeHtmlAttribute(math)}"></${mathTag}>`;
+        }
+
+        if (tag === "br" || tag === "hr") return `<${tag}>`;
+        if (tag === "img") return "";
+
+        const children = serializeChildren(element);
+        const allowed = new Set([
+          "p",
+          "ul",
+          "ol",
+          "li",
+          "blockquote",
+          "h1",
+          "h2",
+          "h3",
+          "h4",
+          "h5",
+          "h6",
+          "pre",
+          "code",
+          "strong",
+          "b",
+          "em",
+          "i",
+          "span",
+          "div",
+          "table",
+          "thead",
+          "tbody",
+          "tr",
+          "th",
+          "td",
+        ]);
+        if (!allowed.has(tag)) return children;
+        if (tag === "code") {
+          const languageClass = Array.from(element.classList).find((name) => /^language-[a-z0-9_-]+$/i.test(name));
+          return `<code${languageClass ? ` class="${escapeHtmlAttribute(languageClass)}"` : ""}>${children}</code>`;
+        }
+        return `<${tag}>${children}</${tag}>`;
+      }
+
+      const panel =
+        document.querySelector("immersive-panel") ||
+        document.querySelector("extended-response-panel");
+      const editor =
+        document.querySelector("#extended-response-markdown-content") ||
+        document.querySelector("#extended-response-message-content .ProseMirror") ||
+        document.querySelector("immersive-editor .ProseMirror") ||
+        document.querySelector("extended-response-panel .ProseMirror");
+      const title =
+        normalizeText(panel?.querySelector(".card-title")?.textContent || "") ||
+        normalizeText(panel?.querySelector("header, .header")?.textContent || "").replace(/\s*(标题\s*1|创建).*$/u, "") ||
+        normalizeText(editor?.querySelector("h1, h2, h3")?.textContent || "");
+      const text = normalizeText(editor?.innerText || editor?.textContent || "");
+      const html = editor ? serializeChildren(editor) : "";
+      return { title, text, html };
+    });
+
+    if (!documentData.text) {
+      console.warn(`IMMERSIVE_SKIP turn=${record.turn} reason=empty_document`);
+      continue;
+    }
+
+    const header = documentData.title || entry?.title || record.immersiveEntries?.[0]?.title || "Gemini Canvas";
+    const textBlock = `[Gemini Canvas: ${header}]\n\n${documentData.text}`;
+    const htmlBlock = `<hr><h2>${escapeHtml(header)}</h2>${documentData.html || `<p>${escapeHtml(documentData.text)}</p>`}`;
+    const currentText = String(record.assistantText || "").trim();
+    const currentHtml = String(record.assistantHtml || "").trim();
+
+    if (!currentText.includes(documentData.text.slice(0, 80))) {
+      record.assistantText = currentText ? `${currentText}\n\n${textBlock}` : textBlock;
+    }
+    if (!currentHtml.includes(documentData.html.slice(0, 120))) {
+      record.assistantHtml = currentHtml ? `${currentHtml}${htmlBlock}` : htmlBlock;
+    }
+    record.immersiveDocuments = [
+      ...(Array.isArray(record.immersiveDocuments) ? record.immersiveDocuments : []),
+      {
+        title: header,
+        text: documentData.text,
+        html: documentData.html,
+      },
+    ];
+    if (!Array.isArray(record.immersiveEntries) || !record.immersiveEntries.length) {
+      record.immersiveEntries = [{
+        title: entry?.title || header,
+        label: entry?.label || entry?.title || header,
+      }];
+    }
+    exported.push({ turn: record.turn, title: header, textLength: documentData.text.length });
+    console.log(`IMMERSIVE_DOC turn=${record.turn} title=${JSON.stringify(header)} chars=${documentData.text.length}`);
+  }
+
+  return exported;
 }
 
 const args = readArgs();
@@ -1395,8 +1756,15 @@ const imageMatchStats = await matchUploadedImagesToSlides({
 });
 console.log(
   `IMAGE_MATCH matched=${imageMatchStats.matched}/${imageMatchStats.attempted}` +
+  ` unmatched=${imageMatchStats.unmatched || 0}` +
+  ` skippedPageHints=${imageMatchStats.skippedPageHints || 0}` +
   (imageMatchStats.unavailable ? " unavailable=true" : ""),
 );
+
+const immersiveDocuments = await exportImmersiveDocuments({
+  page,
+  records,
+});
 
 const interactiveViews = await exportInteractiveViews({
   browser,
@@ -1412,9 +1780,9 @@ const restoredInteractiveViews = await hydrateInteractiveViewsFromFiles({
 });
 const dedupeStats = dedupeSlideRecords(records, totalPages);
 applyExpectedPages(records, totalPages);
-if (dedupeStats.removed || dedupeStats.missingPages.length) {
+if (dedupeStats.removed || dedupeStats.marked || dedupeStats.missingPages.length) {
   console.log(
-    `PAGE_DEDUPE removed=${dedupeStats.removed} mapped=${dedupeStats.mappedPages}/${totalPages}` +
+    `PAGE_DEDUPE removed=${dedupeStats.removed} marked=${dedupeStats.marked || 0} mapped=${dedupeStats.mappedPages}/${totalPages}` +
     (dedupeStats.missingPages.length ? ` missing=${dedupeStats.missingPages.join(",")}` : ""),
   );
 }
@@ -1449,8 +1817,13 @@ const transcript = {
   exportedAt: new Date().toISOString(),
   source: {
     type: "gemini-dom",
-    extractor: "gemsync-manager",
-    note: "assistantText and assistantHtml are extracted from Gemini DOM without summarizing or rewriting. interactiveViews stores Gemini sandbox widgets as local HTML when present.",
+    extractor: "decksync",
+    note: "assistantText and assistantHtml are extracted from Gemini DOM without summarizing or rewriting. Gemini Canvas documents are appended to their source turns when present. interactiveViews stores Gemini sandbox widgets as local HTML when present.",
+  },
+  immersiveDocumentCount: immersiveDocuments.length,
+  immersiveDocumentStats: {
+    exported: immersiveDocuments.length,
+    documents: immersiveDocuments,
   },
   interactiveViewCount,
   interactiveViewStats: {
@@ -1463,7 +1836,7 @@ const transcript = {
     imageBackedPages: records.reduce((total, record) => total + (record.hasUserImage && !record.missingImage ? Math.max(1, Number(record.consumesSlides || 1)) : 0), 0),
     missingImageRecords: records.filter((record) => record.missingImage).length,
     imageMatch: imageMatchStats,
-    rule: "Only Gemini turns with actual uploaded images consume PDF pages. Text-only turns stay as placeholders with expectedPage.",
+    rule: "Only Gemini turns with verified uploaded-image matches consume PDF pages. Text-only and ambiguous-image turns stay as placeholders with expectedPage.",
   },
   records,
 };

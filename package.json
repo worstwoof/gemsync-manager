@@ -1,12 +1,21 @@
 {
-  "name": "gemsync-manager",
+  "name": "decksync",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "setup": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-env.ps1",
     "start": "node server.mjs",
-    "check": "node --check server.mjs"
+    "check": "node scripts/check_code_syntax.mjs",
+    "check:brand": "node scripts/check_brand_assets.mjs",
+    "check:ps": "node scripts/check_powershell_syntax.mjs",
+    "check:setup": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-env.ps1 -CheckOnly -SkipNpm",
+    "doctor": "node scripts/doctor.mjs",
+    "doctor:live": "node scripts/doctor_live_automation.mjs",
+    "smoke:start": "node scripts/smoke_start_port.mjs",
+    "smoke:real-start": "node scripts/smoke_real_start.mjs",
+    "smoke": "node scripts/smoke_decksync.mjs",
+    "verify": "npm run check && npm run check:brand && npm run check:ps && npm run check:setup && npm run doctor && npm run smoke:start && npm run smoke:real-start && npm run smoke"
   },
   "dependencies": {
     "katex": "^0.17.0",

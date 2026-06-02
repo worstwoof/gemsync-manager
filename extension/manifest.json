@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Reading Marker",
-  "description": "Adds Gemini reading markers and PDF page sync.",
-  "version": "1.7.3",
+  "name": "DeckSync Marker",
+  "description": "Adds Gemini and ChatGPT reading markers with PDF page sync.",
+  "version": "1.7.7",
   "permissions": [
     "storage",
     "tabs"
@@ -19,14 +19,18 @@
         "pdf-panel/**"
       ],
       "matches": [
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
       ]
     }
   ],
   "content_scripts": [
     {
       "matches": [
-        "https://gemini.google.com/*"
+        "https://gemini.google.com/*",
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
       ],
       "js": [
         "content.js"

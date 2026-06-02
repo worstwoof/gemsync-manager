@@ -3,16 +3,16 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>GemSync Manager</title>
+    <title>DeckSync</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
-        <div class="brand-mark">GS</div>
+        <div class="brand-mark">DS</div>
         <div>
-          <strong>GemSync Manager</strong>
-          <span>把课程文件夹导入 Gemini + PDF 同步插件</span>
+          <strong>DeckSync</strong>
+          <span>把课程文件夹导入 AI 对话 + PDF 同步插件</span>
         </div>
       </div>
       <div class="top-actions">
@@ -49,14 +49,44 @@
 
         <div class="hint-box">
           插件已经和这个程序绑定。换学科时，只需要重新选择“学科文件夹”。
+          <button id="organizeWorkspace" type="button" class="quiet">整理目录</button>
+        </div>
+
+        <div class="parallel-guide">
+          <div class="parallel-guide-head">
+            <strong>同时跑两个课</strong>
+            <button id="openManagerWindow" type="button" class="quiet">新开一个管理器页面</button>
+          </div>
+          <div class="parallel-guide-grid">
+            <div>
+              <strong>先点这个按钮</strong>
+              <span>它会再打开一个 DeckSync 页面。</span>
+            </div>
+            <div>
+              <strong>两个页面分开用</strong>
+              <span>页面 1 选课程 A + ChatGPT，页面 2 选课程 B + Gemini。</span>
+            </div>
+            <div>
+              <strong>日志怎么看</strong>
+              <span>当前页面显示当前选中课程的任务和日志；另一个课程去另一个页面看。</span>
+            </div>
+          </div>
+          <p>点按钮就会再开一个管理器页面。一个页面管一门课，日志也分开看。</p>
         </div>
 
         <div class="settings-box">
           <div class="settings-head">
             <strong>自动提问设置</strong>
-            <span>启动 Gemini 自动问时使用</span>
+            <span>启动所选模型自动问时使用</span>
           </div>
           <div class="settings-grid">
+            <label>
+              <span>提问路径</span>
+              <select id="providerSelect">
+                <option value="gemini">Gemini</option>
+                <option value="chatgpt">ChatGPT</option>
+              </select>
+            </label>
             <label>
               <span>主模型</span>
               <select id="modelSelect">
@@ -65,7 +95,15 @@
                 <option value="flash-lite">Gemini Flash-Lite</option>
               </select>
             </label>
-            <label>
+            <label id="chatgptThinkingField" class="is-hidden">
+              <span>ChatGPT 模式</span>
+              <select id="chatgptThinking">
+                <option value="thinking-advanced">Thinking 进阶</option>
+                <option value="thinking-standard">Thinking 标准</option>
+                <option value="instant">Instant</option>
+              </select>
+            </label>
+            <label id="proFallbackField">
               <span>Pro 额度用完后</span>
               <select id="proFallback">
                 <option value="flash">继续用 Flash</option>
@@ -82,6 +120,13 @@
                 <option value="3">3 页</option>
               </select>
             </label>
+            <label class="toggle-field">
+              <input id="autoCacheDecks" type="checkbox" />
+              <span>
+                <strong>整份 PPT 问完后自动缓存</strong>
+                <small>中途停止、额度用完或报错时不会缓存；等这一份全部问完才缓存。</small>
+              </span>
+            </label>
           </div>
           <label>
             <span>重复发送的提示词</span>
@@ -89,7 +134,7 @@
           </label>
           <label>
             <span>对话开头预提示词</span>
-            <textarea id="prePromptText" rows="3" placeholder="可选。每个新 Gemini 对话开头只发送一次，用来说明后续回答风格。"></textarea>
+            <textarea id="prePromptText" rows="3" placeholder="可选。每个新对话开头只发送一次，用来说明后续回答风格。"></textarea>
           </label>
         </div>
       </section>
@@ -107,7 +152,7 @@
             <div class="step-index">1</div>
             <div class="step-copy">
               <div class="step-title"><strong>扫描文件夹</strong><span class="step-tag required">先做</span></div>
-              <span>先确认这门课有多少 PDF、PPT、截图和 Gemini 对话。</span>
+              <span>先确认这门课有多少 PDF、PPT、截图和所选模型对话。</span>
             </div>
             <button id="scan" type="button" class="primary">扫描文件夹</button>
           </div>
@@ -124,8 +169,8 @@
           <div class="step-item" data-step="chrome">
             <div class="step-index">3</div>
             <div class="step-copy">
-              <div class="step-title"><strong>打开 Gemini 标签页</strong><span class="step-tag once">只需一次</span></div>
-              <span>优先在已有自动化 Chrome 里新开标签页。第一次如果端口没开，才会启动自动化 Chrome。</span>
+              <div class="step-title"><strong>打开模型标签页</strong><span class="step-tag once">登录一次</span></div>
+              <span>Gemini 和 ChatGPT 都走网页端登录态，需要先在自动化 Chrome 里确认已登录。</span>
             </div>
             <button id="chrome" type="button">打开标签页</button>
           </div>
@@ -133,7 +178,7 @@
           <div class="step-item" data-step="gemini">
             <div class="step-index">4</div>
             <div class="step-copy">
-              <div class="step-title"><strong>启动 Gemini 自动问</strong><span class="step-tag long">长任务</span></div>
+              <div class="step-title"><strong>启动自动问</strong><span class="step-tag long">长任务</span></div>
               <span>需要先有截图 Deck。只有 PDF 时不能自动上传截图提问。</span>
             </div>
             <div class="step-actions">
@@ -146,7 +191,7 @@
             <div class="step-index">5</div>
             <div class="step-copy">
               <div class="step-title"><strong>写入插件</strong><span class="step-tag final">先写入</span></div>
-              <span>把 PDF、Gemini 对话链接和页数写进插件。写完后重新加载 Chrome 扩展。</span>
+              <span>把 PDF、所选模型对话和页数写进插件。写完后重新加载 Chrome 扩展。</span>
             </div>
             <button id="updatePlugin" type="button" class="primary">写入插件</button>
           </div>
@@ -155,7 +200,7 @@
             <div class="step-index">6</div>
             <div class="step-copy">
               <div class="step-title"><strong>生成离线缓存</strong><span class="step-tag long">长任务</span></div>
-              <span>把 Gemini 完整聊天、Markdown、LaTeX、代码和动态组件保存到本地缓存版。</span>
+              <span>把完整聊天、Markdown、LaTeX、代码和动态组件保存到本地缓存版。</span>
               <div id="cacheDeckList" class="cache-deck-list"></div>
             </div>
             <div class="step-actions">
@@ -171,7 +216,7 @@
         <div class="panel-head">
           <div>
             <h2>扫描结果</h2>
-            <p>这里看文件和对话有没有对上。数量不对时，先别启动自动问。</p>
+            <p>这里看 PDF、PPT、截图和对话数量有没有对上。</p>
           </div>
         </div>
         <div id="summaryCards" class="cards"></div>
@@ -182,7 +227,7 @@
         <div class="panel-head">
           <div>
             <h2>任务</h2>
-            <p>截图转换、Gemini 自动提问、写入插件都会留在这里。</p>
+            <p>截图转换、自动提问、写入插件都会留在这里。</p>
           </div>
           <div class="jobs-actions">
             <button id="clearFinishedJobs" type="button">清空过期任务</button>
